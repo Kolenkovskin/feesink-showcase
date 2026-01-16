@@ -23,3 +23,8 @@ logs/
 # OS noise
 .DS_Store
 Thumbs.db
+
+# FeeSink local backups
+feesink/api/*.bak.*
+feesink/storage/*.bak.*
+
