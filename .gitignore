@@ -1,0 +1,25 @@
+# FeeSink .gitignore (v2026.01.15-01)
+
+# Python / venv
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+
+# Local runtime artifacts
+feesink.db
+*.sqlite
+logs/
+.cache/
+
+# Patch backups / safety copies
+*.bak.*
+*.bak
+
+# OS noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,11 @@
+# FeeSink pre-commit config
+# Keeps module-size rule enforced locally before commits.
+
+repos:
+  - repo: local
+    hooks:
+      - id: feesink-module-size
+        name: FeeSink module size guard (<=700 lines)
+        entry: python scripts/lint_module_size.py
+        language: system
+        pass_filenames: false
