@@ -1,22 +1,13 @@
 # FeeSink module size guard
-# FEESINK-LINT-MODULE-SIZE v2026.01.16-01
+# FEESINK-LINT-MODULE-SIZE v2026.01.16-02
 #
 # Policy:
-# - Default max lines per .py: 700
-# - Allowlist exceptions for transitional baseline ONLY (explicit, minimal).
-# - Deterministic output; non-zero exit on violation.
+# - Runtime code must be <= DEFAULT_MAX_LINES (700) unless explicitly allowlisted.
+# - One-off patch scripts are excluded by pattern: scripts/apply_patch_*.py
+#   Rationale: patches are historical migration artifacts, not runtime product code.
 #
 # Run:
 #   python .\scripts\lint_module_size.py
-#
-# Notes:
-# - Counts physical lines in UTF-8 text.
-# - Skips venv/.venv, __pycache__, .git, build artifacts.
-# - Only checks files under repo root (feesink/, scripts/ by default).
-#
-# IMPORTANT:
-# - Allowlist must be reduced/removed as soon as files are split under 700.
-# - This is a controlled migration aid, not a permanent bypass.
 
 from __future__ import annotations
 
@@ -24,22 +15,17 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Dict, List, Tuple
 
-VERSION = "FEESINK-LINT-MODULE-SIZE v2026.01.16-01"
+
+VERSION = "FEESINK-LINT-MODULE-SIZE v2026.01.16-02"
 UTC = timezone.utc
 
 DEFAULT_MAX_LINES = 700
-
-# relative paths from repo root
 DEFAULT_INCLUDE_DIRS = ("feesink", "scripts")
 
 # Transitional allowlist (baseline)
-# Exact limits set to current measured line counts so the rule stays meaningful.
-# If a file grows beyond this, the hook will fail.
-ALLOWLIST_OVER_700: dict[str, int] = {
-    "feesink/api/server.py": 1491,
-    "feesink/storage/sqlite.py": 1040,
-}
+ALLOWLIST_OVER_700: dict[str, int] = {}
 
 SKIP_DIR_NAMES = {
     ".git",
@@ -56,6 +42,16 @@ SKIP_DIR_NAMES = {
 
 SKIP_FILE_SUFFIXES = {".pyc"}
 
+# Exclude one-off migration/patch scripts (history artifacts)
+EXCLUDE_REL_PREFIXES = (
+    "scripts/archive/",
+    "scripts/_archive/",
+)
+
+EXCLUDE_REL_PATTERNS = (
+    "scripts/apply_patch_",
+)
+
 
 @dataclass(frozen=True)
 class Violation:
@@ -69,13 +65,23 @@ def _utc_now() -> str:
 
 
 def _repo_root() -> Path:
-    # scripts/.. = repo root
     return Path(__file__).resolve().parents[1]
 
 
 def _should_skip_dir(path: Path) -> bool:
     parts = set(path.parts)
     return any(x in parts for x in SKIP_DIR_NAMES)
+
+
+def _excluded_rel(rel: str) -> bool:
+    rel_norm = rel.replace("\\", "/")
+    for pfx in EXCLUDE_REL_PREFIXES:
+        if rel_norm.startswith(pfx):
+            return True
+    for pat in EXCLUDE_REL_PATTERNS:
+        if rel_norm.startswith(pat):
+            return True
+    return False
 
 
 def _count_lines(p: Path) -> int:
@@ -93,6 +99,9 @@ def _iter_py_files(root: Path, include_dirs: tuple[str, ...]) -> list[Path]:
             if p.suffix in SKIP_FILE_SUFFIXES:
                 continue
             if _should_skip_dir(p.parent):
+                continue
+            rel = p.relative_to(root).as_posix()
+            if _excluded_rel(rel):
                 continue
             out.append(p)
     out.sort(key=lambda x: x.as_posix().lower())
