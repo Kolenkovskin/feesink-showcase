@@ -28,3 +28,11 @@ Thumbs.db
 feesink/api/*.bak.*
 feesink/storage/*.bak.*
 
+
+# FeeSink runtime logs (local + CI artifacts)
+logs/*.txt
+logs/*.log
+
+# Optional: temporary sqlite smoke DBs if ever written under logs/
+logs/*.db
+
