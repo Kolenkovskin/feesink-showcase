@@ -1,5 +1,5 @@
-"""
-FEESINK-IMPORT-SMOKE v2026.01.17-01
+r"""
+FEESINK-IMPORT-SMOKE v2026.01.17-03
 
 Purpose:
 - Fail fast on ImportError/SyntaxError after refactors/splits.
@@ -12,8 +12,11 @@ Hard requirements (FeeSink P0):
   - script version
   - sha1 of relevant project .py files (stable order)
   - TS_UTC
-- Append run output to:
-  C:\\Users\\User\\PycharmProjects\\feesink\\logs\\import_smoke.txt
+- Append run output to a per-script log file under project logs/.
+  On Windows local dev, logs/ resolves to:
+    C:\Users\User\PycharmProjects\feesink\logs
+  On Linux (CI), logs/ resolves to:
+    <repo>/logs
 """
 
 from __future__ import annotations
@@ -24,11 +27,9 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import List
 
-SCRIPT_VERSION = "FEESINK-IMPORT-SMOKE v2026.01.17-01"
-LOGS_DIR_WIN = r"C:\Users\User\PycharmProjects\feesink\logs"
-LOG_FILE_WIN = os.path.join(LOGS_DIR_WIN, "import_smoke.txt")
+SCRIPT_VERSION = "FEESINK-IMPORT-SMOKE v2026.01.17-03"
 
 
 def _utc_now_iso() -> str:
@@ -43,11 +44,21 @@ def _sha1_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _repo_root() -> Path:
+    # repo root = parent of "scripts/"
+    return Path(__file__).resolve().parents[1]
+
+
+def _logs_dir(root: Path) -> Path:
+    # Cross-platform logs directory inside repo
+    return root / "logs"
+
+
+def _log_file(root: Path) -> Path:
+    return _logs_dir(root) / "import_smoke.txt"
+
+
 def _collect_hash_targets(root: Path) -> List[Path]:
-    """
-    Deterministic allowlist of important modules for import smoke.
-    Keep this list stable; add files when new splits happen.
-    """
     rels = [
         "scripts/import_smoke.py",
         "feesink/api/server.py",
@@ -75,7 +86,6 @@ def _collect_hash_targets(root: Path) -> List[Path]:
         p = root / r
         if p.exists():
             out.append(p)
-    # stable order
     out.sort(key=lambda x: str(x).lower())
     return out
 
@@ -93,8 +103,8 @@ class _Tee:
         self._fp.flush()
 
 
-def _ensure_logs_dir() -> None:
-    os.makedirs(LOGS_DIR_WIN, exist_ok=True)
+def _ensure_logs_dir(root: Path) -> None:
+    _logs_dir(root).mkdir(parents=True, exist_ok=True)
 
 
 def _print_banner(root: Path) -> None:
@@ -104,6 +114,7 @@ def _print_banner(root: Path) -> None:
     print(SCRIPT_VERSION)
     print("TS_UTC=", _utc_now_iso())
     print("ROOT=", str(root))
+    print("LOG_FILE=", str(_log_file(root)))
     print("HASH_TARGETS=", len(targets))
     print("-" * 80)
     for p in targets:
@@ -113,17 +124,16 @@ def _print_banner(root: Path) -> None:
 
 
 def _do_imports() -> None:
-    # import-only: should raise if broken
     import feesink.storage.sqlite  # noqa: F401
     import feesink.api.server  # noqa: F401
 
 
 def main() -> int:
-    # repo root = parent of "scripts/"
-    root = Path(__file__).resolve().parents[1]
+    root = _repo_root()
+    _ensure_logs_dir(root)
 
-    _ensure_logs_dir()
-    with open(LOG_FILE_WIN, "a", encoding="utf-8") as f:
+    log_path = _log_file(root)
+    with log_path.open("a", encoding="utf-8") as f:
         tee = _Tee(f)
         old_stdout = sys.stdout
         sys.stdout = tee
