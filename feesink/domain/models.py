@@ -117,6 +117,8 @@ class Endpoint:
     - interval_minutes > 0
     - next_check_at is UTC aware datetime
     - paused_reason set only when enabled=False
+    - last_check_at (if set) is UTC aware datetime
+    - last_result (if set) is limited to OK|FAIL (schema constraint)
     """
     endpoint_id: EndpointId
     account_id: AccountId
@@ -127,6 +129,10 @@ class Endpoint:
     next_check_at: datetime  # UTC
 
     paused_reason: Optional[PausedReason] = None
+
+    # Optional telemetry (nullable in schema)
+    last_check_at: Optional[datetime] = None  # UTC
+    last_result: Optional[CheckResult] = None  # OK|FAIL only
 
     def validate(self) -> None:
         if not self.endpoint_id or not self.endpoint_id.strip():
@@ -141,6 +147,16 @@ class Endpoint:
             raise ValueError("interval_minutes must be > 0")
 
         _ = ensure_utc(self.next_check_at)
+
+        if self.last_check_at is not None:
+            _ = ensure_utc(self.last_check_at)
+
+        if self.last_result is not None:
+            if not isinstance(self.last_result, CheckResult):
+                raise TypeError("last_result must be CheckResult")
+            # schema.sql allows only ok|fail here
+            if self.last_result not in (CheckResult.OK, CheckResult.FAIL):
+                raise ValueError("last_result must be OK or FAIL (telemetry)")
 
         if self.enabled:
             if self.paused_reason is not None:
