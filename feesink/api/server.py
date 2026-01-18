@@ -1,9 +1,9 @@
 """
-FeeSink — API skeleton (Self-Service v1) + minimal HTML success page
+FeeSink — API skeleton (Self-Service v1) + minimal HTML landing page
 API_CONTRACT: v2026.01.01-API-01 (docs/API_CONTRACT_v1.md)
 
 Run (PowerShell, from repo root):
-  .\\.venv\\Scripts\\python.exe -m feesink.api.server
+  .\.venv\Scripts\python.exe -m feesink.api.server
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from feesink.api.app import FeeSinkApiApp
 # Version banner (must print at startup)
 # ----------------------------
 
-API_VERSION = "FEESINK-API-SKELETON v2026.01.16-API-SPLIT-01"
+API_VERSION = "FEESINK-API-SKELETON v2026.01.18-RENDER-PORT-ROOT-01"
 
 
 def _safe_getattr(mod, name: str, default: str) -> str:
@@ -33,9 +33,15 @@ def _sha256_hex_prefix(s: str, n: int = 8) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:n]
 
 
-def _get_render_port(default: int = 8789) -> int:
-    # Render injects PORT. Locally we fall back to FEESINK_API_PORT or default.
-    port_raw = (os.getenv("PORT") or os.getenv("FEESINK_API_PORT") or str(default)).strip()
+def _get_listen_host() -> str:
+    # Render must bind on 0.0.0.0 to expose the service publicly.
+    # Allow override, but default to 0.0.0.0.
+    return (os.getenv("FEESINK_API_HOST") or "0.0.0.0").strip()
+
+
+def _get_listen_port() -> int:
+    # Render provides PORT env var. Use it first.
+    port_raw = (os.getenv("PORT") or os.getenv("FEESINK_API_PORT") or "8789").strip()
     try:
         return int(port_raw)
     except Exception:
@@ -43,19 +49,24 @@ def _get_render_port(default: int = 8789) -> int:
         raise SystemExit(2)
 
 
-def _print_startup_banner(host: str, port: int) -> None:
+def _print_startup_banner() -> None:
     worker_v = "unknown"
     sqlite_v = "unknown"
     try:
         from feesink.runtime import worker as worker_mod  # type: ignore
+
         worker_v = _safe_getattr(worker_mod, "FEESINK_WORKER_VERSION", "unknown")
     except Exception:
         pass
     try:
         from feesink.storage import sqlite as sqlite_mod  # type: ignore
+
         sqlite_v = _safe_getattr(sqlite_mod, "STORAGE_VERSION", "unknown")
     except Exception:
         pass
+
+    host = _get_listen_host()
+    port = _get_listen_port()
 
     storage_kind = (os.getenv("FEESINK_STORAGE") or "memory").strip().lower()
     db_abs_path: Optional[str] = None
@@ -81,6 +92,7 @@ def _print_startup_banner(host: str, port: int) -> None:
     print("=" * 80)
     print(f"MODE: STRIPE_{stripe_mode.upper()}")
     print(f"LISTEN: http://{host}:{port}")
+    print(f"ENV: PORT={os.getenv('PORT')!r} FEESINK_API_PORT={os.getenv('FEESINK_API_PORT')!r}")
 
     if storage_kind == "sqlite":
         print("STORAGE: sqlite")
@@ -114,18 +126,58 @@ def _print_startup_banner(host: str, port: int) -> None:
     print("=" * 80)
 
 
+def _landing_html(api_version: str) -> bytes:
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>FeeSink</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 40px; }}
+    code {{ background:#f3f3f3; padding:2px 6px; border-radius:6px; }}
+    .box {{ max-width: 720px; }}
+    .muted {{ color:#666; }}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>FeeSink</h1>
+    <p class="muted">Status: <b>OK</b></p>
+    <p>API version: <code>{api_version}</code></p>
+    <p class="muted">This is a minimal landing page. API endpoints are documented in <code>API_CONTRACT_v1.md</code>.</p>
+  </div>
+</body>
+</html>"""
+    return html.encode("utf-8")
+
+
+def _wsgi_app(environ, start_response, inner_app):
+    # Serve landing at "/" to avoid confusing 404 on the product URL.
+    path = (environ.get("PATH_INFO") or "").strip()
+    if path == "" or path == "/":
+        body = _landing_html(API_VERSION)
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+            ],
+        )
+        return [body]
+
+    return inner_app(environ, start_response)
+
+
 def main() -> None:
-    # IMPORTANT for Render:
-    # - bind host 0.0.0.0
-    # - use PORT env if present
-    host = (os.getenv("FEESINK_API_HOST") or "0.0.0.0").strip()
-    port = _get_render_port(default=8789)
+    _print_startup_banner()
 
-    _print_startup_banner(host, port)
+    host = _get_listen_host()
+    port = _get_listen_port()
 
-    app = FeeSinkApiApp(api_version=API_VERSION)
+    inner = FeeSinkApiApp(api_version=API_VERSION)
 
-    httpd = make_server(host, port, app)
+    httpd = make_server(host, port, lambda e, s: _wsgi_app(e, s, inner))
     print(f"Listening on http://{host}:{port}")
     httpd.serve_forever()
 
