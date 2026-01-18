@@ -1,10 +1,15 @@
 """
 FeeSink SQLite: checks (record_check_and_charge).
 
-Split from feesink/storage/sqlite.py without behavior changes.
+CANON invariants:
+- prepaid balance only (no negative balances)
+- 1 check = 1 unit
+- charge strictly after the check event exists (same atomic tx is OK)
+- idempotent charging via dedup_key (UNIQUE(dedup_key))
+- storage must NOT enforce dedup_key format (any non-empty string is valid)
 
 Version:
-- FEESINK-SQLITE-CHECKS v2026.01.16-01
+- FEESINK-SQLITE-CHECKS v2026.01.16-03
 """
 
 from __future__ import annotations
@@ -27,28 +32,39 @@ class SQLiteChecksMixin:
         charge_units: int,
         dedup_key: str,
     ) -> ChargeResult:
+        # ----------- validation -----------
         if not account_id or not str(account_id).strip():
             raise ValidationError("account_id must be non-empty")
-        if not event:
+        if event is None:
             raise ValidationError("event must be provided")
-        if charge_units <= 0:
-            raise ValidationError("charge_units must be > 0")
+        if int(charge_units) != 1:
+            raise ValidationError("CANON: charge_units must be 1 (1 check = 1 unit)")
         if not dedup_key or not str(dedup_key).strip():
             raise ValidationError("dedup_key must be non-empty")
 
-        if int(charge_units) != 1:
-            raise ValidationError("CANON: charge_units must be 1 (1 check = 1 unit)")
-
         try:
-            check_id = str(event.check_id)
+            # Domain model uses ts (UTC enforced)
+            ts_utc = ensure_utc(event.ts)
+            ts_s = dt_to_str_utc(ts_utc)
+
+            # scheduled_at_utc: for MVP we accept it equals event.ts
+            # (format/true scheduled time is worker responsibility)
+            scheduled_at_s = ts_s
+
             result_s = str(event.result.value)
-            ts_s = dt_to_str_utc(ensure_utc(event.ts_utc))
-            scheduled_at_s = dt_to_str_utc(ensure_utc(event.scheduled_at_utc))
+            http_status_i = int(event.http_status) if event.http_status is not None else None
+            latency_ms_i = int(event.latency_ms) if event.latency_ms is not None else None
+            error_class_s = str(event.error_class.value) if event.error_class is not None else None
         except Exception as e:
             raise ValidationError(f"invalid CheckEvent: {e}") from e
 
         now_s = dt_to_str_utc(datetime.now(tz=UTC))
 
+        # Canon decision:
+        # check_id derived from dedup_key to keep idempotency key auditable.
+        check_id = str(dedup_key)
+
+        # ----------- atomic section -----------
         self._conn.execute("BEGIN IMMEDIATE;")
         try:
             cur = self._conn.cursor()
@@ -60,10 +76,12 @@ class SQLiteChecksMixin:
             row = cur.fetchone()
             if row is None:
                 raise NotFound("account not found")
+
             balance_units = int(row["balance_units"])
             status_str = str(row["status"])
 
-            if balance_units < charge_units:
+            # prepaid only: do not insert check_event, do not charge, never go negative
+            if balance_units < 1:
                 if status_str != "depleted":
                     cur.execute(
                         "UPDATE accounts SET status = ?, updated_at_utc = ? WHERE account_id = ?",
@@ -73,6 +91,7 @@ class SQLiteChecksMixin:
                 self._conn.rollback()
                 raise Conflict("insufficient balance_units")
 
+            # 1) Insert check_event (idempotent by UNIQUE(dedup_key))
             cur.execute(
                 """
                 INSERT INTO check_events(
@@ -89,17 +108,19 @@ class SQLiteChecksMixin:
                     str(scheduled_at_s),
                     str(ts_s),
                     str(result_s),
-                    int(event.http_status) if event.http_status is not None else None,
-                    int(event.latency_ms) if event.latency_ms is not None else None,
-                    str(event.error_class.value) if event.error_class is not None else None,
+                    http_status_i,
+                    latency_ms_i,
+                    error_class_s,
                     str(dedup_key),
-                    int(charge_units),
+                    1,
                     now_s,
                 ),
             )
 
-            new_balance = balance_units - charge_units
+            # 2) Charge account (still inside same tx)
+            new_balance = balance_units - 1
             new_status = "depleted" if new_balance <= 0 else "active"
+
             cur.execute(
                 "UPDATE accounts SET balance_units = ?, status = ?, updated_at_utc = ? WHERE account_id = ?",
                 (int(new_balance), str(new_status), now_s, str(account_id)),
@@ -110,10 +131,20 @@ class SQLiteChecksMixin:
             return ChargeResult(inserted=True, event=event, new_balance_units=int(new_balance))
 
         except sqlite3.IntegrityError:
+            # Dedup hit -> must NOT charge again
             self._conn.rollback()
-            # import cycle safe: call self.get_account (provided by Accounts mixin)
-            acc = self.get_account(account_id)  # type: ignore[attr-defined]
-            return ChargeResult(inserted=False, event=event, new_balance_units=int(acc.balance_units))
+            try:
+                acc = self.get_account(account_id)  # type: ignore[attr-defined]
+                return ChargeResult(inserted=False, event=event, new_balance_units=int(acc.balance_units))
+            except Exception as e:
+                raise StorageError(f"dedup rollback ok, but failed to read account: {e}") from e
+
+        except (NotFound, Conflict, ValidationError):
+            self._conn.rollback()
+            raise
         except sqlite3.Error as e:
             self._conn.rollback()
             raise StorageError(str(e)) from e
+        except Exception as e:
+            self._conn.rollback()
+            raise StorageError(f"unexpected error: {e}") from e

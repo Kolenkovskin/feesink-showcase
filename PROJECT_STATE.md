@@ -1,172 +1,118 @@
-# PROJECT_STATE — FeeSink
+# FeeSink — Project State
 
-## Meta
+**Project:** FeeSink  
+**Last updated:** 2026-01-17  
+**Status:** MVP-ready / Pre-sales  
+**Mode:** P0
 
-* Project: FeeSink
-* Date: 2026-01-05
-* TZ: Europe/Tallinn
-* Mode: STRIPE_TEST_ONLY
+---
+
+## TL;DR
+
+FeeSink достиг состояния **технической и биллинговой готовности**.  
+Core-инварианты зафиксированы smoke-тестами и CI-guards.  
+Проект готов к **pre-sales и первым платным пользователям**.
 
 ---
 
 ## Current Phase
 
-**Phase 3 — Stripe TEST (single-scenario)**
+### Phase 4 — MVP Ready / Pre-Sales ✅
 
-Цель этапа: добиться полностью воспроизводимого сценария
+**Definition of Done:**
+- Stripe LIVE billing verified end-to-end
+- Storage contracts stable and covered by smoke
+- Idempotency guarantees enforced
+- CI guards prevent regressions
+- Product canon fixed (prepaid units only)
 
-```
-POST /v1/stripe/checkout_sessions
-→ Stripe Checkout
-→ webhook checkout.session.completed
-→ provider_events recorded
-→ TopUp credited
-→ accounts.balance_units updated
-```
+**Status:** ACHIEVED
 
 ---
 
-## What Works (Confirmed)
+## Verified Milestones
 
-1. **Stripe Checkout Session**
+### Billing & Payments
+- Stripe LIVE mode configured and verified
+- One-time top-ups supported
+- Idempotent processing by `tx_hash`
+- TEST/LIVE kill-switch via `FEESINK_STRIPE_MODE`
+- No subscriptions, no custody, no fiat storage
 
-   * Endpoint `/v1/stripe/checkout_sessions` стабильно создаёт session.
-   * `stripe_links` корректно пишет `session_id → account_id`.
+### Storage
+- SQLite storage fully split into small modules (≤700 LOC)
+- Storage contracts verified by `db_smoke_sqlite.py`
+- Invariants enforced:
+  - prepaid balance only
+  - 1 check = 1 unit
+  - no negative balance
+  - no double charge on retries
 
-2. **Webhook Delivery**
+### CI & Safety Guards
+- `import_smoke.py` — fail-fast import guard (PASS)
+- `db_smoke_sqlite.py` — billing smoke (PASS)
+- `lint_module_size.py` — module size guard ≤700 LOC (PASS)
+- CI order enforced:
+  1. import_smoke
+  2. sqlite smoke
+  3. size guard
+- Smoke logs uploaded as CI artifacts on failure
 
-   * Stripe webhook доставляется.
-   * Signature validation OK.
-   * Событие `checkout.session.completed` получено.
-
-3. **provider_events**
-
-   * События Stripe записываются.
-   * Dedup по `provider_event_id` работает.
-   * Повторные webhook не дублируют события.
-
-4. **Price Mapping**
-
-   * `metadata.price_id` совпадает с `STRIPE_PRICE_ID_EUR_50`.
-   * `credited_units = 5000` вычисляется корректно.
-
----
-
-## What Fails (Blocking)
-
-### ❌ TopUp Credit Path
-
-* `TopUp` **не всегда создаётся корректно**.
-* Фиксированы ошибки:
-
-  * `TypeError`
-  * `AttributeError`
-
-Причина:
-
-* Рассинхрон между:
-
-  * сигнатурой `TopUp` в `feesink.domain.models`
-  * фактическим созданием `TopUp` в `server.py`
-
-**Каноническая сигнатура (факт):**
-
-```python
-TopUp(account_id, tx_hash, amount_usdt, credited_units, ts)
-```
-
-Любые дополнительные поля (`topup_id`, `created_at_utc`) **недопустимы**.
+### Architecture
+- API and storage split into deterministic modules
+- Facade pattern preserved
+- Large historical patch scripts archived (`scripts/_archive/`)
+- No active module exceeds size limits
 
 ---
 
-## Database State
+## Product Canon (Locked)
 
-* `provider_events`: записи есть
-* `stripe_links`: записи есть
-* `topups`: **пусто**
-* `accounts.balance_units`: не увеличивается
+The following rules are **non-negotiable**:
 
-Вывод: credit не проходит до storage.
-
----
-
-## Scripts Situation
-
-Каталог `scripts/` содержит серию patch-скриптов (v01–v13),
-созданных итеративно для локализации ошибки.
-
-Проблемы:
-
-* отсутствовала единая точка канона
-* версии не были связаны с документацией
-
-Решение:
-
-* ввести `SCRIPTS_INDEX.md`
-* закрепить правило логирования запусков в `logs/*.txt`
+- Prepaid balance only
+- 1 check = 1 unit
+- Charge occurs strictly after check event fixation
+- Idempotency by `dedup_key` / `tx_hash`
+- Insufficient funds is a valid state, not an error
+- No subscriptions
+- No custody
+- No fiat balance storage
 
 ---
 
-## ACTIVE_FOCUS (next chat)
+## What Is NOT Done Yet
 
-**ACTIVE_FOCUS (from 2026-01-06, Europe/Tallinn)**
+### P0 (Required for Sales)
+- Product-facing README (one-pager style)
+- Final pricing table for units
+- Stable public HTTPS endpoint (non-ngrok)
+- Minimal onboarding instructions
 
-Задача:
-
-* Привести `server.py` в строгое соответствие сигнатуре `TopUp`
-* Убедиться, что `credit_topup()` вызывается и успешно пишет `topups`
-
-Ограничения:
-
-* Stripe TEST ONLY
-* Один сценарий
-* Без рефакторинга вне credit path
+### P1 (Post First Users)
+- Simple dashboard or CLI onboarding helper
+- Usage notifications / alerts
+- Additional storage backend (optional)
 
 ---
 
-## Exit Criteria for Phase 3 TEST
+## Next Intended Phase
 
-Этап считается завершённым, когда:
+### Phase 5 — First Paying Users
 
-1. Один checkout → один webhook → один topup
-2. `accounts.balance_units` увеличен
-3. Повтор webhook не создаёт дубликат
+**Goal:**
+- Accept first real payments from external users
+- Validate pricing and usage patterns
+- Keep scope minimal, avoid feature creep
+
+**Exit Criteria:**
+- ≥1 external paying user
+- ≥1 real-world usage scenario confirmed
+- No billing regressions detected by CI
 
 ---
 
-## Project State
+## Notes
 
-(see previous content above)
-
-## Stripe TEST — Credit Status
-
-* **PASS** (2026-01-05, Europe/Tallinn): `checkout.session.completed` → credit executed.
-
-  * event_id: `evt_1SmJaG1a011Sg5etroLY0d5P`
-  * tx_hash: `stripe:evt_1SmJaG1a011Sg5etroLY0d5P`
-  * credited_units: `5000`
-  * idempotency: provider_event dedup + tx_hash dedup **OK**
-  * verification: `scripts/db_probe_stripe_chain.py` shows `topups.found=True`, `accounts.balance_units>0`
-
-## Stripe LIVE — Milestone
-
-Status: CONFIGURED (PASS)
-
-Scope:
-- Stripe LIVE one-time topup
-- Webhook-driven credit (checkout.session.completed)
-- Idempotent processing (tx_hash, provider_event_id)
-
-Evidence:
-- LIVE event processed: evt_1SmjUm1a011Sg5etKqSCjSzK
-- LIVE session: cs_live_a1xC1f0caukTSofmJjTQjqjrcO8rLc6KVv6C0nEdNcz8YUPkuGZQlrekLK
-- Price: price_1SmiXl1a011Sg5etLdMAEPFr (50 EUR → 5000 units)
-- Credit applied, balance_units > 0
-
-Operational notes:
-- FEESINK_STRIPE_MODE=live
-- Production requires env price_id = 50 EUR
-- Test prices must not be mapped in LIVE
-
-Conclusion:
-Stripe billing pipeline is fully configured and validated end-to-end in LIVE.
+This document is the **single source of truth** for project readiness.  
+Any downgrade of status requires explicit justification and revision.

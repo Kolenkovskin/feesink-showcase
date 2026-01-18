@@ -1,165 +1,82 @@
-## README.md — каноническая версия (Stripe TEST)
+FeeSink
 
-````md
-# FeeSink
+Prepaid monitoring for APIs & endpoints. No subscriptions. No surprises.
 
-FeeSink — сервис prepaid-биллинга для HTTP-проверок (endpoint watchdog).
-Модель: **prepaid only**, 1 check = 1 unit, строгая идемпотентность.
+FeeSink — это сервис, который следит за доступностью ваших HTTP-эндпоинтов и списывает оплату только за фактические проверки.
+Вы пополняете баланс заранее — сервис работает, пока есть средства.
 
-Проект сейчас находится в режиме **Stripe TEST (single-scenario)**.
+Зачем FeeSink
 
----
+Большинство мониторингов:
 
-## Текущий статус проекта
+требуют подписку,
 
-**Этап:** Phase 3 — Stripe TEST  
-**Режим:** один сценарий, одна БД, один price_id
+списывают фиксированно,
 
-### Что работает
-- HTTP API v1
-- Prepaid-баланс (units)
-- Stripe Checkout (TEST)
-- Webhook `checkout.session.completed`
-- Запись `provider_events`
-- Mapping `stripe_session_id → account_id`
-- Идемпотентность по `topups.tx_hash`
+продолжают брать деньги, даже когда вы не пользуетесь сервисом.
 
-### Что проверяется / стабилизируется
-- Credit topup (увеличение `accounts.balance_units`)
-- Поведение при retry webhook
-- Логирование причин `credit_failed`
+FeeSink работает иначе.
 
----
+Как это работает
 
-## Stripe TEST — single-scenario (канон)
+Вы пополняете баланс (prepaid units)
 
-### Инварианты
-- Используется **только** `sk_test_*`
-- Используется **один** TEST `price_id`
-- Используется **одна** SQLite БД
-- Dedup `provider_events` **не блокирует credit**
-- Идемпотентность credit — **только** по `topups.tx_hash`
+Добавляете endpoint для проверки
 
----
+FeeSink выполняет проверки
 
-## Переменные окружения (обязательно)
+С баланса списывается ровно столько, сколько проверок было сделано
 
-```text
-FEESINK_SQLITE_DB=C:\Users\User\PycharmProjects\feesink\feesink.db
-STRIPE_SECRET_KEY=sk_test_...
-STRIPE_WEBHOOK_SECRET=whsec_...
-STRIPE_PRICE_ID_EUR_50=price_...
-````
+Нет проверок — нет списаний.
 
-> Все переменные задаются **через Run / Debug Configurations**
-> `.env` не используется для секретов.
+Для кого
 
----
+Indie-разработчики
 
-## Локальный запуск API
+SaaS-проекты на ранней стадии
 
-```powershell
-(.venv) PS> python feesink/api/server.py
-```
+Внутренние API и бэкенды
 
-Ожидаемый стартовый баннер:
+Любые сервисы, где важна доступность, но не нужна подписка
 
-* MODE: STRIPE_TEST_ONLY
-* SQLITE_DB: путь к feesink.db
-* STRIPE_SECRET_KEY prefix: sk_test
-* Issued token for account_id=demo-user
+Ключевые принципы
 
----
+💳 Prepaid, не подписка
 
-## Stripe Checkout — пошагово
+📊 Оплата только за фактические проверки
 
-### 1. Получить token
+🔒 Детерминированная бухгалтерия
 
-Берётся из стартового баннера:
+🧱 Идемпотентность и защита от двойных списаний
 
-```
-[DEV] Issued token for account_id=demo-user: <TOKEN>
-```
+⚙️ Простая интеграция через HTTP
 
-### 2. Создать checkout session
+Чего FeeSink не делает
 
-```powershell
-$token="<TOKEN>"
+❌ Не продаёт подписки
 
-$resp = Invoke-RestMethod -Method Post `
-  -Uri "http://127.0.0.1:8789/v1/stripe/checkout_sessions" `
-  -Headers @{ Authorization = "Bearer $token" } `
-  -ContentType "application/json" `
-  -Body (@{ price_id = $env:STRIPE_PRICE_ID_EUR_50 } | ConvertTo-Json)
+❌ Не списывает деньги «по расписанию»
 
-$resp.checkout_session | Select id, url
-```
+❌ Не хранит лишние данные
 
-### 3. Перейти по `url` и оплатить
+❌ Не прячет логику биллинга
 
-Использовать тестовую карту Stripe:
+Статус проекта
 
-```
-4242 4242 4242 4242
-MM/YY — любые
-CVC — любые
-```
+Stripe LIVE: ✅
 
-### 4. Проверить результат
+Prepaid-модель: ✅
 
-```powershell
-python scripts/db_probe_stripe_chain.py
-```
+Smoke-тесты (import + storage): ✅
 
-Ожидаемо:
+Готовность к продаже: MVP
 
-* provider_event: `checkout.session.completed`
-* stripe_links: FOUND
-* price mapping: match = True
-* topup: FOUND
-* account.balance_units > 0
+Подробные технические контракты и архитектура доступны в репозитории,
+но не требуются для начала использования.
 
----
+Следующий шаг
 
-## Скрипты (важно)
+👉 Связаться для раннего доступа / пилотного использования
+(контакт или форма будут добавлены на следующем этапе)
 
-* `scripts/db_probe_*.py` — **диагностика**, сервер не требуется
-* `scripts/apply_patch_*.py` — **одноразовые патчи**
-
-  * каждый патч:
-
-    * делает `.bak`
-    * печатает BEFORE / AFTER
-    * пишет лог в `logs/*.txt`
-
-Назначение каждого скрипта описано в **SCRIPTS_INDEX.md**.
-
----
-
-## Документация — источник истины
-
-* `PROJECT_STATE.md` — текущее состояние проекта
-* `SPEC.md` — канон поведения
-* `storage_contract.md` — контракт storage ↔ domain
-* `STRIPE_CONTRACT_v1.md` — Stripe API (Checkout)
-* `STRIPE_WEBHOOK_CONTRACT_v1.md` — webhook канон
-
-Если факт в коде ≠ документации — **ошибка**.
-
----
-
-## Правило чатов
-
-* Один чат = один этап
-* Перед новым чатом:
-
-  * обновить документацию
-  * зафиксировать PROJECT_STATE
-  * определить ACTIVE_FOCUS
-
-Без этого продолжение запрещено.
-
-```
-
----
-
+FeeSink — когда мониторинг не превращается в подписку.
