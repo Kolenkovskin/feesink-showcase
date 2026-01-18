@@ -3,14 +3,13 @@ FeeSink — API skeleton (Self-Service v1) + minimal HTML success page
 API_CONTRACT: v2026.01.01-API-01 (docs/API_CONTRACT_v1.md)
 
 Run (PowerShell, from repo root):
-  .\.venv\Scripts\python.exe -m feesink.api.server
+  .\\.venv\\Scripts\\python.exe -m feesink.api.server
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-from datetime import timezone
 from typing import Optional
 from wsgiref.simple_server import make_server
 
@@ -34,7 +33,17 @@ def _sha256_hex_prefix(s: str, n: int = 8) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:n]
 
 
-def _print_startup_banner() -> None:
+def _get_render_port(default: int = 8789) -> int:
+    # Render injects PORT. Locally we fall back to FEESINK_API_PORT or default.
+    port_raw = (os.getenv("PORT") or os.getenv("FEESINK_API_PORT") or str(default)).strip()
+    try:
+        return int(port_raw)
+    except Exception:
+        print(f"FATAL: PORT/FEESINK_API_PORT must be int, got: {port_raw!r}")
+        raise SystemExit(2)
+
+
+def _print_startup_banner(host: str, port: int) -> None:
     worker_v = "unknown"
     sqlite_v = "unknown"
     try:
@@ -47,14 +56,6 @@ def _print_startup_banner() -> None:
         sqlite_v = _safe_getattr(sqlite_mod, "STORAGE_VERSION", "unknown")
     except Exception:
         pass
-
-    host = (os.getenv("FEESINK_API_HOST") or "127.0.0.1").strip()
-    port_raw = (os.getenv("FEESINK_API_PORT") or "8789").strip()
-    try:
-        port = int(port_raw)
-    except Exception:
-        print(f"FATAL: FEESINK_API_PORT must be int, got: {port_raw!r}")
-        raise SystemExit(2)
 
     storage_kind = (os.getenv("FEESINK_STORAGE") or "memory").strip().lower()
     db_abs_path: Optional[str] = None
@@ -114,10 +115,13 @@ def _print_startup_banner() -> None:
 
 
 def main() -> None:
-    _print_startup_banner()
+    # IMPORTANT for Render:
+    # - bind host 0.0.0.0
+    # - use PORT env if present
+    host = (os.getenv("FEESINK_API_HOST") or "0.0.0.0").strip()
+    port = _get_render_port(default=8789)
 
-    host = (os.getenv("FEESINK_API_HOST") or "127.0.0.1").strip()
-    port = int(os.getenv("FEESINK_API_PORT") or "8789")
+    _print_startup_banner(host, port)
 
     app = FeeSinkApiApp(api_version=API_VERSION)
 
