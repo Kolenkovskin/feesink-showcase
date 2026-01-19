@@ -1,11 +1,11 @@
-# feesink/storage/_sqlite_stripe.py
+# file: feesink/storage/_sqlite_stripe.py
 """
 FeeSink SQLite: Stripe helper methods used by API.
 
 Split from feesink/storage/sqlite.py without behavior changes.
 
 Version:
-- FEESINK-SQLITE-STRIPE v2026.01.19-03
+- FEESINK-SQLITE-STRIPE v2026.01.19-04
 """
 
 from __future__ import annotations
@@ -137,6 +137,17 @@ class SQLiteStripeMixin:
             raise ValidationError("stripe_session_id must be non-empty")
         if not account_id or not str(account_id).strip():
             raise ValidationError("account_id must be non-empty")
+
+        # P1/P0 invariant for self-issued token flow:
+        # stripe_links(account_id) must not fail FK when account doesn't exist yet.
+        # Ensure accounts row exists BEFORE inserting stripe_links.
+        try:
+            ensure = getattr(self, "ensure_account", None)
+            if callable(ensure):
+                ensure(account_id)  # type: ignore[misc]
+        except Exception as e:
+            # If account creation itself fails, surface deterministic StorageError.
+            raise StorageError(f"ensure_account failed: {e}") from e
 
         created_at_utc = ensure_utc(created_at_utc)
         created_s = dt_to_str_utc(created_at_utc)
