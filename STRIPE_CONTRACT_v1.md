@@ -1,6 +1,7 @@
+
 # STRIPE_CONTRACT_v1.md
 
-Version: v2026.01.05-02
+Version: v2026.01.19-01
 Status: TEST / CANONICAL
 Scope: FeeSink – Stripe Checkout + Webhook (TEST ONLY)
 
@@ -28,7 +29,7 @@ This contract has higher priority than implementation convenience.
 Required:
 
 * `STRIPE_SECRET_KEY` starts with `sk_test_`
-* `STRIPE_WEBHOOK_SECRET` corresponds to `stripe listen` TEST endpoint
+* `STRIPE_WEBHOOK_SECRET` corresponds to TEST endpoint (when webhooks are used)
 
 If violated → integration is considered invalid.
 
@@ -39,25 +40,29 @@ If violated → integration is considered invalid.
 Endpoint:
 
 ```
+
 POST /v1/stripe/checkout_sessions
+
 ```
 
-Input:
+Request body:
 
-```json
-{
-  "price_id": "price_..."
-}
-```
+* **EMPTY / IGNORED** (client MUST NOT select price)
+
+Price source of truth (P0):
+
+* Checkout price is selected **only** from ENV:
+  * `STRIPE_PRICE_ID_EUR_50`
 
 Requirements:
 
 * Authorization: Bearer token (dev token allowed in TEST)
-* `price_id` MUST match an entry in `PRICE_UNITS_MAPPING_v1.md`
+* `STRIPE_PRICE_ID_EUR_50` MUST be set
+* `STRIPE_PRICE_ID_EUR_50` MUST match an entry in `PRICE_UNITS_MAPPING_v1.md`
 
 Side effects:
 
-* A Stripe Checkout Session is created
+* A Stripe Checkout Session is created using `STRIPE_PRICE_ID_EUR_50`
 * A row is inserted/upserted into `stripe_links`
 
 `stripe_links`:
@@ -75,7 +80,9 @@ Failure to create `stripe_links` = contract violation.
 Endpoint:
 
 ```
+
 POST /v1/webhooks/stripe
+
 ```
 
 Accepted Stripe event:
@@ -145,14 +152,15 @@ This is a hard failure.
 
 Mapping source:
 
-* Environment variables
-* `PRICE_UNITS_MAPPING_v1.md`
+* `PRICE_UNITS_MAPPING_v1.md` (canonical)
 
-Example:
+Example (TEST):
 
 ```
+
 STRIPE_PRICE_ID_EUR_50=price_1Sm6YZ1a011Sg5et7jxHXA8e
-```
+
+````
 
 Failure cases:
 
@@ -184,7 +192,7 @@ TopUp(
   credited_units,
   ts
 )
-```
+````
 
 Rules:
 
@@ -251,7 +259,4 @@ Silent failure is forbidden.
 * Stripe TEST canonical contract
 * Stripe LIVE is explicitly OUT OF SCOPE
 
-Next step after closure:
 
-* Freeze TEST
-* Open new chat for LIVE migration

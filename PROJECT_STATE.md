@@ -116,3 +116,18 @@ The following rules are **non-negotiable**:
 
 This document is the **single source of truth** for project readiness.  
 Any downgrade of status requires explicit justification and revision.
+
+
+MVP_PUBLIC_VISUAL_CONFIRMED | 2026-01-18 | https://feesink.onrender.com
+
+
+DOMAIN_PURCHASED | 2026-01-18 | feesink.com | registrar=cloudflare
+
+
+DOMAIN_SSL_READY | 2026-01-18 | feesink.com, www.feesink.com | render-managed
+
+
+MVP_LIVE_PUBLIC | 2026-01-18 | https://feesink.com
+
+
+Stripe TEST contract frozen (v2026.01.19-01)
