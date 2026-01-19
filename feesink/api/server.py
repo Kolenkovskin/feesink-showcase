@@ -127,6 +127,10 @@ def _print_startup_banner() -> None:
 
 
 def _landing_html(api_version: str) -> bytes:
+    # Public landing:
+    # - asks for token
+    # - creates Stripe Checkout Session via POST /v1/stripe/checkout_sessions
+    # - redirects to Stripe url
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -134,19 +138,132 @@ def _landing_html(api_version: str) -> bytes:
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>FeeSink</title>
   <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 40px; }}
-    code {{ background:#f3f3f3; padding:2px 6px; border-radius:6px; }}
+    body {{
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      margin: 40px;
+      color: #111;
+      background: #fff;
+    }}
     .box {{ max-width: 720px; }}
+    code {{ background:#f3f3f3; padding:2px 6px; border-radius:6px; }}
     .muted {{ color:#666; }}
+    .row {{ margin-top: 14px; }}
+    input {{
+      width: 100%;
+      max-width: 520px;
+      padding: 12px 12px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 14px;
+    }}
+    .btn {{
+      display: inline-block;
+      margin-top: 12px;
+      padding: 12px 18px;
+      background: #111;
+      color: #fff;
+      border: 0;
+      border-radius: 8px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .err {{
+      margin-top: 10px;
+      color: #b00020;
+      white-space: pre-wrap;
+    }}
+    .ok {{
+      margin-top: 10px;
+      color: #0b6b0b;
+      white-space: pre-wrap;
+    }}
+    .small {{ font-size: 13px; }}
   </style>
 </head>
 <body>
   <div class="box">
     <h1>FeeSink</h1>
-    <p class="muted">Status: <b>OK</b></p>
-    <p>API version: <code>{api_version}</code></p>
-    <p class="muted">This is a minimal landing page. API endpoints are documented in <code>API_CONTRACT_v1.md</code>.</p>
+    <p class="muted">Prepaid endpoint monitoring API.</p>
+
+    <p class="small">
+      Invariants: <b>1 check = 1 unit</b> · prepaid only · no subscriptions.
+    </p>
+
+    <div class="row">
+      <label for="token" class="small"><b>Token</b> (Bearer)</label><br/>
+      <input id="token" placeholder="paste your token here" autocomplete="off" />
+      <div class="small muted" style="margin-top:6px;">
+        Token is required to create a Stripe Checkout Session.
+      </div>
+    </div>
+
+    <button class="btn" id="payBtn">Pay €50 → Get 5000 units</button>
+
+    <div id="msg" class="err" style="display:none;"></div>
+
+    <p class="muted" style="margin-top:18px;">
+      API version: <code>{api_version}</code><br/>
+      Contract: <code>API_CONTRACT_v1.md</code>
+    </p>
   </div>
+
+<script>
+(function() {{
+  function show(kind, text) {{
+    var el = document.getElementById("msg");
+    el.style.display = "block";
+    el.className = kind;
+    el.textContent = text;
+  }}
+
+  async function createCheckout() {{
+    var token = (document.getElementById("token").value || "").trim();
+    if (!token) {{
+      show("err", "Token is required.");
+      return;
+    }}
+
+    show("ok", "Creating Stripe Checkout Session...");
+    try {{
+      var resp = await fetch("/v1/stripe/checkout_sessions", {{
+        method: "POST",
+        headers: {{
+          "Authorization": "Bearer " + token,
+          "Content-Type": "application/json"
+        }},
+        body: "{{}}"
+      }});
+
+      var text = await resp.text();
+      var data = null;
+      try {{ data = JSON.parse(text); }} catch (e) {{ data = null; }}
+
+      if (!resp.ok) {{
+        if (data && data.error) {{
+          show("err", "Error: " + (data.error.code || "unknown") + "\\n" + (data.error.message || ""));
+        }} else {{
+          show("err", "Error: HTTP " + resp.status + "\\n" + text);
+        }}
+        return;
+      }}
+
+      var url = data && data.checkout_session && data.checkout_session.url;
+      if (!url) {{
+        show("err", "Error: missing checkout_session.url");
+        return;
+      }}
+
+      window.location.href = url;
+    }} catch (e) {{
+      show("err", "Network error: " + (e && e.message ? e.message : String(e)));
+    }}
+  }}
+
+  document.getElementById("payBtn").addEventListener("click", function() {{
+    createCheckout();
+  }});
+}})();
+</script>
 </body>
 </html>"""
     return html.encode("utf-8")
