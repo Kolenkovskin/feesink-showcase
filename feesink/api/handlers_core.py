@@ -1,5 +1,5 @@
 # FeeSink API core handlers (HTTP endpoints + dev topups)
-# FEESINK-API-HANDLERS-CORE v2026.01.19-01
+# FEESINK-API-HANDLERS-CORE v2026.01.19-02
 
 from __future__ import annotations
 
@@ -24,6 +24,32 @@ def _now_utc() -> datetime:
 def _auth_account(app, environ) -> Tuple[Optional[str], Optional[Tuple[int, list, bytes]]]:
     account_id, err = app.auth_account_id(environ)
     return account_id, err
+
+
+def _status_to_public(value: object) -> str:
+    """
+    Normalize internal AccountStatus to public API string.
+
+    Internal may be:
+      - enum AccountStatus.ACTIVE
+      - string "active"
+      - other printable representation
+    Public contract:
+      "active" | "paused" | "inactive" | "unknown"
+    """
+    if value is None:
+        return "unknown"
+    # Enum repr often looks like "AccountStatus.ACTIVE"
+    s = str(value).strip()
+    if not s:
+        return "unknown"
+    if "." in s:
+        s = s.split(".")[-1]
+    s = s.lower()
+
+    if s in ("active", "paused", "inactive"):
+        return s
+    return "unknown"
 
 
 def handle_get_ui_success(app, environ):
@@ -60,7 +86,7 @@ def handle_get_accounts_balance(app, environ):
     """
     GET /v1/accounts/balance
     Auth: Bearer token
-    Returns: account_id, balance_units, status
+    Returns: account_id, balance_units, status, units_per_check
     """
     account_id, err = _auth_account(app, environ)
     if err:
@@ -78,7 +104,8 @@ def handle_get_accounts_balance(app, environ):
             "account": {
                 "account_id": acc.account_id,
                 "balance_units": int(acc.balance_units),
-                "status": str(acc.status),
+                "status": _status_to_public(getattr(acc, "status", None)),
+                "units_per_check": 1,
             }
         },
     )
@@ -185,7 +212,6 @@ def handle_post_topups_dev(app, environ):
     except Exception as ex:
         return error(400, "invalid_request", "Unable to convert amount_usdt to units", {"exception": type(ex).__name__})
 
-    # Create TopUp model
     from feesink.domain.models import TopUp  # type: ignore
 
     tx_hash = f"dev:{account_id}:{int(_now_utc().timestamp())}"
