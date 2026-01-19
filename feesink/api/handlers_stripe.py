@@ -1,5 +1,5 @@
 # FeeSink API Stripe handlers
-# FEESINK-API-HANDLERS-STRIPE v2026.01.16-01
+# FEESINK-API-HANDLERS-STRIPE v2026.01.19-02
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ import os
 import urllib.parse
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Tuple
+from typing import Optional
 
-from feesink.api._http import UTC, error, json_response, read_raw_body, utc_iso
+from feesink.api._http import UTC, error, get_bearer_token, json_response, read_raw_body, utc_iso
 from feesink.api._stripe import (
     stripe_api_get_json,
     stripe_api_post_form,
@@ -23,11 +23,40 @@ def _now_utc() -> datetime:
     return datetime.now(tz=UTC)
 
 
+def _require_self_issued_token(environ) -> str:
+    """
+    Self-issued token canon:
+    - user creates token themselves
+    - token identifies account_id
+    - token MUST NOT require pre-registration
+    """
+    token = (get_bearer_token(environ) or "").strip()
+    if not token:
+        raise ValueError("missing_token")
+
+    # Minimal hygiene: prevent accidental empty/very short tokens.
+    # Do NOT over-validate format: storage must not dictate token format.
+    if len(token) < 12:
+        raise ValueError("token_too_short")
+    if len(token) > 512:
+        raise ValueError("token_too_long")
+
+    return token
+
+
 def handle_post_stripe_checkout_sessions(app, environ):
-    token, account_id, errr = app.auth_token_and_account(environ)
-    if errr:
-        return errr
-    assert token is not None and account_id is not None
+    # IMPORTANT: self-issued token
+    # Checkout session must NOT require account/token pre-registration.
+    try:
+        token = _require_self_issued_token(environ)
+    except ValueError as ex:
+        reason = str(ex)
+        if reason == "missing_token":
+            return error(401, "unauthorized", "Missing Bearer token", {})
+        return error(401, "unauthorized", "Invalid token", {"reason": reason})
+
+    # Canon: account_id == token (self-issued)
+    account_id = token
 
     secret_key = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
     price_id = (os.getenv("STRIPE_PRICE_ID_EUR_50") or "").strip()
@@ -67,12 +96,21 @@ def handle_post_stripe_checkout_sessions(app, environ):
         customer_id = None
 
     if not session_id or not session_url:
-        return error(502, "bad_gateway", "Stripe response missing session id/url", {"stripe_id": session_id or None})
+        return error(
+            502,
+            "bad_gateway",
+            "Stripe response missing session id/url",
+            {"stripe_id": session_id or None},
+        )
 
     if not hasattr(app.storage, "upsert_stripe_link"):
         return error(500, "internal_error", "Storage does not support stripe_links", {})
     try:
-        app.storage.upsert_stripe_link(account_id=str(account_id), stripe_session_id=session_id, stripe_customer_id=customer_id)  # type: ignore[attr-defined]
+        app.storage.upsert_stripe_link(  # type: ignore[attr-defined]
+            account_id=str(account_id),
+            stripe_session_id=session_id,
+            stripe_customer_id=customer_id,
+        )
     except Exception as ex:
         return error(500, "internal_error", "Failed to store stripe link", {"exception": type(ex).__name__})
 
@@ -99,7 +137,12 @@ def handle_post_webhooks_stripe(app, environ):
         return error(400, "invalid_request", "Missing Stripe event id")
 
     if event_type != "checkout.session.completed":
-        print(json.dumps({"provider": "stripe", "decision": "ignored", "event_id": event_id, "event_type": event_type}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"provider": "stripe", "decision": "ignored", "event_id": event_id, "event_type": event_type},
+                ensure_ascii=False,
+            )
+        )
         return json_response(200, {"ok": True})
 
     data = event.get("data") if isinstance(event.get("data"), dict) else {}
@@ -122,11 +165,27 @@ def handle_post_webhooks_stripe(app, environ):
         if not inserted:
             dedup_by_event_id = True
     except Exception as ex:
-        print(json.dumps({"provider": "stripe", "decision": "provider_event_write_failed", "event_id": event_id, "exception": type(ex).__name__}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"provider": "stripe", "decision": "provider_event_write_failed", "event_id": event_id, "exception": type(ex).__name__},
+                ensure_ascii=False,
+            )
+        )
         return error(500, "internal_error", "Failed to persist provider_event", {"exception": type(ex).__name__})
 
     if payment_status != "paid":
-        print(json.dumps({"provider": "stripe", "decision": "ignored_not_paid", "event_id": event_id, "session_id": session_id, "payment_status": payment_status}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "decision": "ignored_not_paid",
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "payment_status": payment_status,
+                },
+                ensure_ascii=False,
+            )
+        )
         return json_response(200, {"ok": True, "dedup_event": dedup_by_event_id})
 
     # Resolve account_id: metadata.account_id preferred, fallback stripe_links
@@ -150,7 +209,12 @@ def handle_post_webhooks_stripe(app, environ):
                 raise ValueError("resolved_empty_account_id")
             account_id_source = "stripe_links"
         except Exception as ex:
-            print(json.dumps({"provider": "stripe", "decision": "unresolved_account", "event_id": event_id, "session_id": session_id, "exception": type(ex).__name__}, ensure_ascii=False))
+            print(
+                json.dumps(
+                    {"provider": "stripe", "decision": "unresolved_account", "event_id": event_id, "session_id": session_id, "exception": type(ex).__name__},
+                    ensure_ascii=False,
+                )
+            )
             return error(500, "internal_error", "Unable to resolve account_id for session_id", {"session_id": session_id})
 
     # Determine price_id (metadata first; then expand line_items; then API fetch)
@@ -196,7 +260,12 @@ def handle_post_webhooks_stripe(app, environ):
         credited_units = 5000
 
     if credited_units is None:
-        print(json.dumps({"provider": "stripe", "decision": "unresolved_mapping", "event_id": event_id, "account_id": str(account_id), "price_id": price_id}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"provider": "stripe", "decision": "unresolved_mapping", "event_id": event_id, "account_id": str(account_id), "price_id": price_id},
+                ensure_ascii=False,
+            )
+        )
         return error(500, "internal_error", "Unable to map Stripe price_id to credited_units", {"price_id": price_id})
 
     tx_hash = f"stripe:{event_id}"
@@ -238,7 +307,7 @@ def handle_post_webhooks_stripe(app, environ):
             {
                 "provider": "stripe",
                 "decision": decision,
-                "dedup_event": dedup_by_event_id,
+                "dedup_event": False,  # kept for backward compatibility in logs
                 "dedup_tx_hash": dedup_by_tx_hash,
                 "event_id": event_id,
                 "event_type": event_type,
@@ -256,4 +325,4 @@ def handle_post_webhooks_stripe(app, environ):
         )
     )
 
-    return json_response(200, {"ok": True, "dedup_event": dedup_by_event_id, "dedup_tx_hash": dedup_by_tx_hash})
+    return json_response(200, {"ok": True, "dedup_tx_hash": dedup_by_tx_hash})
