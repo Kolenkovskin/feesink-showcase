@@ -1,262 +1,161 @@
+# STRIPE_CONTRACT_v1 — FeeSink
 
-# STRIPE_CONTRACT_v1.md
+Version: v2026.01.19-02  
+Status: **LIVE / FROZEN**  
+Scope: FeeSink — Stripe Checkout + Webhook (LIVE)
 
-Version: v2026.01.19-01
-Status: TEST / CANONICAL
-Scope: FeeSink – Stripe Checkout + Webhook (TEST ONLY)
+---
+
+## ⚠️ LIVE CONTRACT — CHANGE CONTROL (P0)
+
+Этот контракт **заморожен** после подтверждённого факта:
+**STRIPE_LIVE_END2END_PASS (2026-01-19)**.
+
+Любые изменения:
+- допускаются **только** в новом файле `STRIPE_CONTRACT_v2.md`,
+- требуют нового этапа проекта и отдельного milestone.
+
+Изменение данного файла запрещено.
 
 ---
 
 ## 0. Purpose
 
-This document defines the **canonical Stripe contract** for FeeSink in **Stripe TEST** mode.
-Its primary goal is to prevent regressions and repeated integration failures by fixing:
-
-* the exact event that triggers credit,
-* idempotency boundaries,
-* what deduplication may and may NOT block,
-* required DB side effects.
-
-This contract has higher priority than implementation convenience.
+Канонический LIVE-контракт Stripe для FeeSink.  
+Фиксирует **единственно допустимую** логику приёма денег в production.
 
 ---
 
 ## 1. Stripe Mode Invariant (P0)
 
-* Only **Stripe TEST** is allowed while this contract is active.
-* Mixing test/live keys, prices, or webhooks is forbidden.
+- `FEESINK_STRIPE_MODE=live`
+- Используются **только** `sk_live_*`, `whsec_live_*`
+- TEST/LIVE mixing запрещён
 
-Required:
-
-* `STRIPE_SECRET_KEY` starts with `sk_test_`
-* `STRIPE_WEBHOOK_SECRET` corresponds to TEST endpoint (when webhooks are used)
-
-If violated → integration is considered invalid.
+Нарушение = критическая ошибка биллинга.
 
 ---
 
-## 2. Checkout Creation Contract
+## 2. Checkout Creation (LIVE)
 
 Endpoint:
-
-```
 
 POST /v1/stripe/checkout_sessions
 
-```
+yaml
+Copy code
 
-Request body:
+Правила (P0):
 
-* **EMPTY / IGNORED** (client MUST NOT select price)
-
-Price source of truth (P0):
-
-* Checkout price is selected **only** from ENV:
-  * `STRIPE_PRICE_ID_EUR_50`
-
-Requirements:
-
-* Authorization: Bearer token (dev token allowed in TEST)
-* `STRIPE_PRICE_ID_EUR_50` MUST be set
-* `STRIPE_PRICE_ID_EUR_50` MUST match an entry in `PRICE_UNITS_MAPPING_v1.md`
+- Цена выбирается **только** из ENV:
+  - `STRIPE_PRICE_ID_EUR_50`
+- Тело запроса не влияет на цену
+- `price_id` **не принимается** от клиента
 
 Side effects:
 
-* A Stripe Checkout Session is created using `STRIPE_PRICE_ID_EUR_50`
-* A row is inserted/upserted into `stripe_links`
-
-`stripe_links`:
-
-* `stripe_session_id` (PK)
-* `account_id`
-* `created_at_utc`
-
-Failure to create `stripe_links` = contract violation.
+- Создаётся Stripe Checkout Session
+- Записывается `stripe_links(stripe_session_id → account_id)`
 
 ---
 
-## 3. Webhook Event Acceptance
+## 3. Webhook Acceptance
 
 Endpoint:
 
-```
-
 POST /v1/webhooks/stripe
 
-```
+yaml
+Copy code
 
-Accepted Stripe event:
+Единственный событие, которое может привести к credit:
 
-* `checkout.session.completed`
+- `checkout.session.completed`
 
-Ignored events (must NOT fail webhook):
-
-* `payment_intent.*`
-* `charge.*`
-* `price.*`
-* `product.*`
-
-Ignored events must return HTTP 200.
+Все прочие события:
+- принимаются (HTTP 200)
+- **никогда** не приводят к зачислению средств
 
 ---
 
-## 4. provider_events (Dedup Scope)
+## 4. provider_events — Audit Only (P0)
 
-On **every** webhook call:
+- Все события записываются в `provider_events`
+- Dedup по `provider_event_id`
+- **Dedup не является idempotency credit**
 
-* The raw Stripe event MUST be inserted into `provider_events`
-
-`provider_events` dedup rule:
-
-* UNIQUE(`provider`, `provider_event_id`)
-
-**CRITICAL RULE (P0):**
-
-> Deduplication of `provider_events` MUST NOT block credit logic.
-
-Allowed behavior:
-
-* If `provider_event_id` already exists → continue processing
-* provider_events is **audit log**, not a processing gate
-
-Forbidden behavior:
-
-* Returning early because provider_event already exists
-* Using provider_events as idempotency for credit
+Запрещено:
+- использовать provider_events как gate для credit
 
 ---
 
-## 5. Account Resolution Contract
+## 5. Account Resolution (LIVE)
 
-For `checkout.session.completed`:
+Порядок:
 
-Resolution order:
+1. `event.data.object.metadata.account_id`
+2. `stripe_links.account_id` по `session.id`
 
-1. `metadata.account_id` (preferred)
-2. `stripe_links.account_id` via `session.id`
-
-If account_id cannot be resolved:
-
-* Webhook returns HTTP 500
-* provider_event is still recorded
-* Credit MUST NOT be attempted
-
-This is a hard failure.
+Если `account_id` не разрешён:
+- credit запрещён
+- webhook → HTTP 500
+- Stripe выполнит retry
 
 ---
 
-## 6. Price → Units Mapping
+## 6. Price → Units Mapping (P0)
 
-* `metadata.price_id` MUST be present
-* If missing → treat as contract violation
-
-Mapping source:
-
-* `PRICE_UNITS_MAPPING_v1.md` (canonical)
-
-Example (TEST):
-
-```
-
-STRIPE_PRICE_ID_EUR_50=price_1Sm6YZ1a011Sg5et7jxHXA8e
-
-````
-
-Failure cases:
-
-* price_id missing
-* price_id not mapped
-
-Result:
-
-* HTTP 500
-* provider_event recorded
-* credit skipped
+- `metadata.price_id` обязателен
+- Mapping только через `PRICE_UNITS_MAPPING_v1.md`
+- Fallback или расчёты запрещены
 
 ---
 
-## 7. Credit (TopUp) Contract
+## 7. Credit Contract (TopUp)
 
-Credit is triggered **only** by:
+Credit возможен **только если**:
 
-* `checkout.session.completed`
-* `payment_status == paid`
+- событие = `checkout.session.completed`
+- `payment_status == paid`
 
 Domain object:
 
 ```python
 TopUp(
   account_id,
-  tx_hash,
+  tx_hash="stripe:<provider_event_id>",
   amount_usdt,
   credited_units,
-  ts
+  ts_utc
 )
-````
+8. Idempotency (P0)
+Единственная граница идемпотентности credit:
 
-Rules:
-
-* `tx_hash = "stripe:<provider_event_id>"`
-* `ts` MUST be UTC
-
----
-
-## 8. Credit Idempotency (P0)
-
-**The ONLY idempotency boundary for credit:**
-
-```
+Copy code
 topups.tx_hash
-```
+Повторы webhook:
 
-Rules:
+не приводят к двойному зачислению
 
-* `storage.credit_topup()` MUST be idempotent by `tx_hash`
-* Duplicate webhook retries MUST NOT double-credit
-* Duplicate provider_event MUST NOT block first credit
+не блокируют первый credit
 
-Forbidden:
+9. Observability (Required)
+Каждый LIVE credit логирует:
 
-* provider_event-based idempotency
-* silent skip of credit
+provider_event_id
 
----
+session_id
 
-## 9. Failure Semantics
+account_id
 
-If credit fails:
+price_id
 
-* Webhook returns HTTP 500
-* provider_event remains recorded
-* Stripe will retry
+credited_units
 
-On retry:
+decision (credited | dedup | failed)
 
-* credit MUST be attempted again
-* success depends only on `topups.tx_hash`
+Silent failure запрещён.
 
----
-
-## 10. Observability (Required Logs)
-
-On `checkout.session.completed`:
-
-Log MUST include:
-
-* provider_event_id
-* decision (credited | credit_failed | unresolved_mapping | price_not_mapped)
-* resolved_account_id
-* price_id
-* credited_units
-* exception (if any)
-
-Silent failure is forbidden.
-
----
-
-## 11. Status
-
-* Stripe TEST canonical contract
-* Stripe LIVE is explicitly OUT OF SCOPE
-
-
+10. Status
+Stripe LIVE контракт зафиксирован и заморожен.
+Любая правка → новый контракт и новый этап проекта.

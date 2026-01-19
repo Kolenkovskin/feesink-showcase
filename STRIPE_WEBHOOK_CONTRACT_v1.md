@@ -1,89 +1,74 @@
 # STRIPE_WEBHOOK_CONTRACT v1 — FeeSink
 
-## Purpose
-
-This document defines the **canonical contract** for handling Stripe webhooks
-in FeeSink Phase 3 (Stripe).
-
-Scope:
-- Stripe TEST only (current phase)
-- Single-scenario correctness
-- Idempotent crediting
+Version: v2026.01.19-02  
+Status: **LIVE / FROZEN**  
+Scope: Stripe Webhooks (LIVE)
 
 ---
 
-## Supported Event (v1)
+## ⚠️ LIVE WEBHOOK CONTRACT — FROZEN
 
-### checkout.session.completed
+Контракт заморожен после подтверждённого:
+**STRIPE_LIVE_END2END_PASS (2026-01-19)**.
 
-This is the **only** Stripe event that triggers credit in Phase 3.
-
----
-
-## Canonical Payload Assumptions (TEST)
-
-For `checkout.session.completed` in current setup:
-
-- `event.type` = `checkout.session.completed`
-- `event.data.object.payment_status` = `paid`
-- `event.data.object.id` = `session.id`
-- `event.data.object.customer` = `null` (allowed)
-- `event.data.object.line_items` = **absent** (allowed)
-- `event.data.object.metadata` **MUST contain**:
-  - `account_id`
-  - `price_id`
-
-These assumptions are **confirmed by real payloads** in Stripe TEST.
+Изменения запрещены.  
+Расширения — только через `STRIPE_WEBHOOK_CONTRACT_v2.md`.
 
 ---
 
-## Source of Truth Resolution
+## Supported Event (LIVE)
 
-### session.id
-Resolved from:
-- `event.data.object.id`
+Единственный event, допускающий credit:
+
+- `checkout.session.completed`
+
+---
+
+## Canonical LIVE Payload Assumptions
+
+- `event.type = checkout.session.completed`
+- `payment_status = paid`
+- `event.data.object.id = session.id`
+- `metadata.account_id` — обязателен
+- `metadata.price_id` — обязателен
+
+---
+
+## Resolution Rules
 
 ### account_id
-Resolved in order:
-1. `event.data.object.metadata.account_id` (primary, REQUIRED)
-2. (future) lookup via `stripe_links.session_id`
 
-If `account_id` cannot be resolved:
-- credit MUST NOT be applied
-- provider_event MUST be marked as unresolved
+1. `metadata.account_id`
+2. `stripe_links.account_id`
+
+Отсутствие → HTTP 500, credit запрещён.
 
 ---
 
 ### price_id
-Resolved in order:
-1. `event.data.object.metadata.price_id` (primary, REQUIRED)
-2. `event.data.object.line_items[].price.id` (future / optional)
 
-If `price_id` cannot be resolved:
-- credit MUST NOT be applied
-- provider_event MUST be marked as unresolved
+- Берётся **только** из `metadata.price_id`
+- Mapping через `PRICE_UNITS_MAPPING_v1.md`
 
 ---
 
-## Credited Units Calculation
+## Credit Rules (P0)
 
-- `price_id` MUST exist in `PRICE_UNITS_MAPPING_v1.md`
-- `credited_units` is derived **only** from mapping
-- No dynamic calculation or fallback is allowed
-
-If mapping is missing:
-- credit MUST NOT be applied
-- provider_event MUST be marked as unresolved_price_id
+- Credit → только через `TopUp`
+- Idempotency → только `topups.tx_hash`
+- provider_events — audit only
 
 ---
 
-## Idempotency Rules (P0)
+## Failure Semantics
 
-### provider_events
-- Unique by `(provider, provider_event_id)`
-- Used for **audit and observability only**
-- provider_event dedup MUST NOT block credit
+- Любая ошибка credit → HTTP 500
+- provider_event сохраняется
+- Stripe retry допустим и ожидаем
 
-### topups (credit idempotency)
-- Unique by `tx_hash`
-- Stripe tx_hash format:
+---
+
+## Status
+
+LIVE webhook контракт заморожен.  
+Используется как эталон production-поведения.

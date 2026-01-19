@@ -1,5 +1,5 @@
 # FeeSink API app (routing + auth)
-# FEESINK-API-APP v2026.01.16-03
+# FEESINK-API-APP v2026.01.19-01
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from feesink.api._http import UTC, error, get_bearer_token, get_query_param, jso
 from feesink.api.deps import TokenStore, make_storage
 from feesink.api.handlers_core import (
     handle_delete_endpoint,
+    handle_get_accounts_balance,
     handle_get_me,
     handle_get_ui_success,
     handle_patch_endpoint,
@@ -84,6 +85,9 @@ class FeeSinkApiApp:
 
             elif path == "/v1/me" and method == "GET":
                 status, headers, body = handle_get_me(self, environ)
+
+            elif path == "/v1/accounts/balance" and method == "GET":
+                status, headers, body = handle_get_accounts_balance(self, environ)
 
             elif path == "/v1/topups" and method == "POST":
                 status, headers, body = handle_post_topups_dev(self, environ)

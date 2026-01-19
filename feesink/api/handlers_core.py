@@ -1,9 +1,8 @@
 # FeeSink API core handlers (HTTP endpoints + dev topups)
-# FEESINK-API-HANDLERS-CORE v2026.01.16-01
+# FEESINK-API-HANDLERS-CORE v2026.01.19-01
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional, Tuple
@@ -55,6 +54,34 @@ def handle_get_me(app, environ):
     app.storage.ensure_account(account_id)
 
     return json_response(200, {"account": {"account_id": account_id}})
+
+
+def handle_get_accounts_balance(app, environ):
+    """
+    GET /v1/accounts/balance
+    Auth: Bearer token
+    Returns: account_id, balance_units, status
+    """
+    account_id, err = _auth_account(app, environ)
+    if err:
+        return err
+    assert account_id is not None
+
+    try:
+        acc = app.storage.ensure_account(account_id)
+    except Exception as ex:
+        return error(500, "internal_error", "Failed to load account", {"exception": type(ex).__name__})
+
+    return json_response(
+        200,
+        {
+            "account": {
+                "account_id": acc.account_id,
+                "balance_units": int(acc.balance_units),
+                "status": str(acc.status),
+            }
+        },
+    )
 
 
 def handle_post_endpoints(app, environ):
