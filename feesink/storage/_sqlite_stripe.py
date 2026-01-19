@@ -1,10 +1,11 @@
+# feesink/storage/_sqlite_stripe.py
 """
 FeeSink SQLite: Stripe helper methods used by API.
 
 Split from feesink/storage/sqlite.py without behavior changes.
 
 Version:
-- FEESINK-SQLITE-STRIPE v2026.01.16-01
+- FEESINK-SQLITE-STRIPE v2026.01.19-03
 """
 
 from __future__ import annotations
@@ -136,29 +137,54 @@ class SQLiteStripeMixin:
             raise ValidationError("stripe_session_id must be non-empty")
         if not account_id or not str(account_id).strip():
             raise ValidationError("account_id must be non-empty")
+
         created_at_utc = ensure_utc(created_at_utc)
         created_s = dt_to_str_utc(created_at_utc)
+        cust = str(stripe_customer_id).strip() if stripe_customer_id else None
 
         self._conn.execute("BEGIN IMMEDIATE;")
         try:
             cur = self._conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO stripe_links(
-                    stripe_session_id, stripe_customer_id, account_id, created_at_utc
-                ) VALUES(?,?,?,?)
-                ON CONFLICT(stripe_session_id) DO UPDATE SET
-                    stripe_customer_id = excluded.stripe_customer_id,
-                    account_id = excluded.account_id
-                """,
-                (
-                    str(stripe_session_id),
-                    str(stripe_customer_id) if stripe_customer_id else None,
-                    str(account_id),
-                    created_s,
-                ),
-            )
-            cur.close()
+            try:
+                # Primary path: upsert by stripe_session_id (PK)
+                cur.execute(
+                    """
+                    INSERT INTO stripe_links(
+                        stripe_session_id, stripe_customer_id, account_id, created_at_utc
+                    ) VALUES(?,?,?,?)
+                    ON CONFLICT(stripe_session_id) DO UPDATE SET
+                        stripe_customer_id = excluded.stripe_customer_id,
+                        account_id = excluded.account_id
+                    """,
+                    (str(stripe_session_id), cust, str(account_id), created_s),
+                )
+            except sqlite3.IntegrityError as e:
+                # Secondary path: schema.sql enforces UNIQUE(stripe_customer_id) when present.
+                # If a customer repeats across sessions, the INSERT can fail even though
+                # the mapping is valid. Resolve by updating the existing row by customer_id,
+                # moving it to the new session id (PK update is allowed if it doesn't clash).
+                if cust:
+                    cur.execute(
+                        """
+                        UPDATE stripe_links
+                        SET
+                            stripe_session_id = ?,
+                            account_id = ?,
+                            created_at_utc = ?
+                        WHERE stripe_customer_id = ?
+                        """,
+                        (str(stripe_session_id), str(account_id), created_s, cust),
+                    )
+                    updated = int(cur.rowcount or 0)
+                    if updated != 1:
+                        raise StorageError(
+                            f"stripe_links: UNIQUE(stripe_customer_id) conflict but UPDATE by customer_id affected {updated} rows"
+                        ) from e
+                else:
+                    raise
+            finally:
+                cur.close()
+
             self._conn.commit()
         except sqlite3.Error as e:
             self._conn.rollback()
