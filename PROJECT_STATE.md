@@ -131,3 +131,13 @@ MVP_LIVE_PUBLIC | 2026-01-18 | https://feesink.com
 
 
 Stripe TEST contract frozen (v2026.01.19-01)
+
+### Stripe LIVE readiness (mandatory)
+
+Before enabling Stripe LIVE or performing the first real charge:
+
+- [ ] Run `scripts/stripe_env_audit.py`
+- [ ] `SUMMARY=PASS` is required
+- [ ] Audit output must be preserved in `logs/stripe_env_audit.txt`
+
+Starting LIVE without this step is a contract violation.
