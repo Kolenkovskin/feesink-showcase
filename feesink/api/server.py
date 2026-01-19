@@ -1,9 +1,9 @@
 """
-FeeSink — API skeleton (Self-Service v1) + minimal HTML landing page
-API_CONTRACT: v2026.01.01-API-01 (docs/API_CONTRACT_v1.md)
+FeeSink — API server + minimal HTML landing page
+API_CONTRACT: v2026.01.19-02 (docs/API_CONTRACT_v1.md)
 
 Run (PowerShell, from repo root):
-  .\.venv\Scripts\python.exe -m feesink.api.server
+  .\\.venv\\Scripts\\python.exe -m feesink.api.server
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from feesink.api.app import FeeSinkApiApp
 # Version banner (must print at startup)
 # ----------------------------
 
-API_VERSION = "FEESINK-API-SKELETON v2026.01.18-RENDER-PORT-ROOT-01"
+API_VERSION = "FEESINK-API-APP v2026.01.19-01"
 
 
 def _safe_getattr(mod, name: str, default: str) -> str:
