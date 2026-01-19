@@ -1,6 +1,6 @@
 """
 FeeSink — API server + minimal HTML landing page
-API_CONTRACT: v2026.01.19-02 (docs/API_CONTRACT_v1.md)
+API_CONTRACT: v2026.01.19-02 (API_CONTRACT_v1.md)
 
 Run (PowerShell, from repo root):
   .\\.venv\\Scripts\\python.exe -m feesink.api.server
@@ -128,9 +128,10 @@ def _print_startup_banner() -> None:
 
 def _landing_html(api_version: str) -> bytes:
     # Public landing:
-    # - asks for token
-    # - creates Stripe Checkout Session via POST /v1/stripe/checkout_sessions
-    # - redirects to Stripe url
+    # - explain self-issued token
+    # - generate token client-side (no server state)
+    # - create Stripe Checkout Session via POST /v1/stripe/checkout_sessions
+    # - redirect to Stripe url
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -144,13 +145,13 @@ def _landing_html(api_version: str) -> bytes:
       color: #111;
       background: #fff;
     }}
-    .box {{ max-width: 720px; }}
+    .box {{ max-width: 760px; }}
     code {{ background:#f3f3f3; padding:2px 6px; border-radius:6px; }}
     .muted {{ color:#666; }}
     .row {{ margin-top: 14px; }}
     input {{
       width: 100%;
-      max-width: 520px;
+      max-width: 560px;
       padding: 12px 12px;
       border: 1px solid #ddd;
       border-radius: 8px;
@@ -158,11 +159,23 @@ def _landing_html(api_version: str) -> bytes:
     }}
     .btn {{
       display: inline-block;
-      margin-top: 12px;
+      margin-top: 10px;
       padding: 12px 18px;
       background: #111;
       color: #fff;
       border: 0;
+      border-radius: 8px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .btn2 {{
+      display: inline-block;
+      margin-top: 10px;
+      margin-left: 8px;
+      padding: 12px 18px;
+      background: #f3f3f3;
+      color: #111;
+      border: 1px solid #ddd;
       border-radius: 8px;
       font-weight: 700;
       cursor: pointer;
@@ -177,7 +190,9 @@ def _landing_html(api_version: str) -> bytes:
       color: #0b6b0b;
       white-space: pre-wrap;
     }}
-    .small {{ font-size: 13px; }}
+    .small {{ font-size: 13px; line-height: 1.35; }}
+    ul {{ margin-top: 6px; }}
+    li {{ margin: 4px 0; }}
   </style>
 </head>
 <body>
@@ -190,14 +205,33 @@ def _landing_html(api_version: str) -> bytes:
     </p>
 
     <div class="row">
-      <label for="token" class="small"><b>Token</b> (Bearer)</label><br/>
-      <input id="token" placeholder="paste your token here" autocomplete="off" />
-      <div class="small muted" style="margin-top:6px;">
-        Token is required to create a Stripe Checkout Session.
+      <div class="small"><b>Step 1 — Generate a token (API key)</b></div>
+      <div class="small muted">
+        The token identifies your account. You create it yourself (self-issued).
+      </div>
+      <ul class="small muted">
+        <li>Use any long random string (recommended).</li>
+        <li>Keep it secret. Anyone with the token can spend your units.</li>
+        <li>If you lose it, funds tied to that token cannot be recovered.</li>
+      </ul>
+    </div>
+
+    <div class="row">
+      <label for="token" class="small"><b>Token (Bearer)</b></label><br/>
+      <input id="token" placeholder="paste or generate your token here" autocomplete="off" />
+      <div>
+        <button class="btn2" id="genBtn">Generate token</button>
+        <button class="btn2" id="copyBtn">Copy</button>
       </div>
     </div>
 
-    <button class="btn" id="payBtn">Pay €50 → Get 5000 units</button>
+    <div class="row">
+      <div class="small"><b>Step 2 — Pay</b></div>
+      <div class="small muted">
+        Paste your token above, then pay. The payment credits units to that token/account.
+      </div>
+      <button class="btn" id="payBtn">Pay €50 → Get 5000 units</button>
+    </div>
 
     <div id="msg" class="err" style="display:none;"></div>
 
@@ -214,6 +248,39 @@ def _landing_html(api_version: str) -> bytes:
     el.style.display = "block";
     el.className = kind;
     el.textContent = text;
+  }}
+
+  function base64Url(bytes) {{
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    var b64 = btoa(bin);
+    return b64.replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, "");
+  }}
+
+  function generateToken() {{
+    if (!window.crypto || !crypto.getRandomValues) {{
+      show("err", "Crypto RNG is not available in this browser.");
+      return;
+    }}
+    var bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    var t = "t_" + base64Url(bytes);
+    document.getElementById("token").value = t;
+    show("ok", "Token generated. Save it in your password manager.");
+  }}
+
+  async function copyToken() {{
+    var token = (document.getElementById("token").value || "").trim();
+    if (!token) {{
+      show("err", "Nothing to copy: token is empty.");
+      return;
+    }}
+    try {{
+      await navigator.clipboard.writeText(token);
+      show("ok", "Copied to clipboard.");
+    }} catch (e) {{
+      show("err", "Clipboard copy failed. Select the token and copy manually.");
+    }}
   }}
 
   async function createCheckout() {{
@@ -258,6 +325,14 @@ def _landing_html(api_version: str) -> bytes:
       show("err", "Network error: " + (e && e.message ? e.message : String(e)));
     }}
   }}
+
+  document.getElementById("genBtn").addEventListener("click", function() {{
+    generateToken();
+  }});
+
+  document.getElementById("copyBtn").addEventListener("click", function() {{
+    copyToken();
+  }});
 
   document.getElementById("payBtn").addEventListener("click", function() {{
     createCheckout();

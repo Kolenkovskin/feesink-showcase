@@ -1,82 +1,83 @@
-FeeSink
+# FeeSink
 
-Prepaid monitoring for APIs & endpoints. No subscriptions. No surprises.
+**Prepaid endpoint monitoring API. Pay once — spend per check.**
 
-FeeSink — это сервис, который следит за доступностью ваших HTTP-эндпоинтов и списывает оплату только за фактические проверки.
-Вы пополняете баланс заранее — сервис работает, пока есть средства.
+FeeSink — минималистичный API-сервис мониторинга HTTP-эндпоинтов с моделью **prepaid billing**:
+- без подписок,
+- без автосписаний,
+- **1 check = 1 unit**.
 
-Зачем FeeSink
+Service: https://feesink.com
 
-Большинство мониторингов:
+---
 
-требуют подписку,
+## Quick Start (3 steps)
 
-списывают фиксированно,
+### Step 1 — Generate a token (API key)
 
-продолжают брать деньги, даже когда вы не пользуетесь сервисом.
+FeeSink использует **self-issued token**: вы создаёте токен сами.  
+Токен **идентифицирует ваш аккаунт**. Сохраняйте его как пароль.
 
-FeeSink работает иначе.
+Рекомендуемо:
+- password manager → generate random 32+ chars
+- или любой длинный случайный ключ
 
-Как это работает
+**PowerShell генерация (рекомендуемо):**
+```powershell
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$token = "t_" + [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+','-').Replace('/','_')
+$token
+Step 2 — Pay (€50 → 5000 units)
+http
+Copy code
+POST https://feesink.com/v1/stripe/checkout_sessions
+Authorization: Bearer <TOKEN>
+Content-Type: application/json
+Ответ:
 
-Вы пополняете баланс (prepaid units)
+json
+Copy code
+{
+  "checkout_session": {
+    "url": "https://checkout.stripe.com/..."
+  }
+}
+Открой url и заверши оплату.
 
-Добавляете endpoint для проверки
+Step 3 — Check balance
+PowerShell
 
-FeeSink выполняет проверки
+powershell
+Copy code
+$token = "<TOKEN>"
 
-С баланса списывается ровно столько, сколько проверок было сделано
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "https://feesink.com/v1/accounts/balance" `
+  -Headers @{ Authorization = "Bearer $token" }
+Ответ:
 
-Нет проверок — нет списаний.
+json
+Copy code
+{
+  "account": {
+    "account_id": "your-token-or-account",
+    "balance_units": 5000,
+    "status": "active",
+    "units_per_check": 1
+  }
+}
+Billing model (important)
+Prepaid only
 
-Для кого
+1 check = 1 unit
 
-Indie-разработчики
+Списание строго после факта проверки
 
-SaaS-проекты на ранней стадии
+Нет подписок, нет автосписаний
 
-Внутренние API и бэкенды
+Когда баланс = 0 → проверки не выполняются
 
-Любые сервисы, где важна доступность, но не нужна подписка
-
-Ключевые принципы
-
-💳 Prepaid, не подписка
-
-📊 Оплата только за фактические проверки
-
-🔒 Детерминированная бухгалтерия
-
-🧱 Идемпотентность и защита от двойных списаний
-
-⚙️ Простая интеграция через HTTP
-
-Чего FeeSink не делает
-
-❌ Не продаёт подписки
-
-❌ Не списывает деньги «по расписанию»
-
-❌ Не хранит лишние данные
-
-❌ Не прячет логику биллинга
-
-Статус проекта
-
-Stripe LIVE: ✅
-
-Prepaid-модель: ✅
-
-Smoke-тесты (import + storage): ✅
-
-Готовность к продаже: MVP
-
-Подробные технические контракты и архитектура доступны в репозитории,
-но не требуются для начала использования.
-
-Следующий шаг
-
-👉 Связаться для раннего доступа / пилотного использования
-(контакт или форма будут добавлены на следующем этапе)
-
-FeeSink — когда мониторинг не превращается в подписку.
+API
+Полный контракт см. в API_CONTRACT_v1.md
