@@ -1,5 +1,5 @@
-# FeeSink API Stripe handlers
-# FEESINK-API-HANDLERS-STRIPE v2026.01.19-02
+# file: feesink/api/handlers_stripe.py
+# FEESINK-API-HANDLERS-STRIPE v2026.01.20-01
 
 from __future__ import annotations
 
@@ -22,6 +22,12 @@ from feesink.config.canon import MIN_TOPUP_USDT, USDT_TO_UNITS_RATE
 
 def _now_utc() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def _new_request_id(now: datetime) -> str:
+    # stdlib-only, sufficiently unique per process + timestamp
+    # Example: req_2026-01-19T09:00:00.123456Z_pid12345
+    return f"req_{utc_iso(now)}_pid{os.getpid()}"
 
 
 def _require_self_issued_token(environ) -> str:
@@ -49,11 +55,14 @@ def _to_int_units(amount_usdt: Decimal) -> int:
 
 
 def handle_post_stripe_checkout_sessions(app, environ):
+    now = _now_utc()
+    request_id = _new_request_id(now)
+
     # Requires Authorization: Bearer <token>
     try:
         token = _require_self_issued_token(environ)
     except ValueError:
-        return error(401, "unauthorized", "Missing Bearer token", {})
+        return error(401, "unauthorized", "Missing Bearer token", {"request_id": request_id})
 
     account_id = _token_to_account_id(token)
 
@@ -63,13 +72,13 @@ def handle_post_stripe_checkout_sessions(app, environ):
     cancel_url = (os.getenv("STRIPE_CANCEL_URL") or "").strip()
 
     if not secret_key:
-        return error(500, "internal_error", "STRIPE_SECRET_KEY is not set", {})
+        return error(500, "internal_error", "STRIPE_SECRET_KEY is not set", {"request_id": request_id})
     if not price_id:
-        return error(500, "internal_error", "STRIPE_PRICE_ID_EUR_50 is not set", {})
+        return error(500, "internal_error", "STRIPE_PRICE_ID_EUR_50 is not set", {"request_id": request_id})
     if not success_url:
-        return error(500, "internal_error", "STRIPE_SUCCESS_URL is not set", {})
+        return error(500, "internal_error", "STRIPE_SUCCESS_URL is not set", {"request_id": request_id})
     if not cancel_url:
-        return error(500, "internal_error", "STRIPE_CANCEL_URL is not set", {})
+        return error(500, "internal_error", "STRIPE_CANCEL_URL is not set", {"request_id": request_id})
 
     form = {
         "mode": "payment",
@@ -77,6 +86,9 @@ def handle_post_stripe_checkout_sessions(app, environ):
         "cancel_url": cancel_url,
         "line_items[0][price]": price_id,
         "line_items[0][quantity]": "1",
+        # Backup channel: Stripe exposes client_reference_id directly in session
+        "client_reference_id": str(account_id),
+        # Primary channel: metadata for our webhook
         "metadata[token]": token,
         "metadata[account_id]": str(account_id),
         "metadata[price_id]": str(price_id),
@@ -84,7 +96,12 @@ def handle_post_stripe_checkout_sessions(app, environ):
 
     obj, err2 = stripe_api_post_form(secret_key, "/v1/checkout/sessions", form)
     if err2 or not obj:
-        return error(502, "bad_gateway", "Stripe request failed", {"reason": err2})
+        return error(
+            502,
+            "bad_gateway",
+            "Stripe request failed",
+            {"request_id": request_id, "reason": err2},
+        )
 
     session_id = (obj.get("id") or "").strip()
     session_url = (obj.get("url") or "").strip()
@@ -99,13 +116,14 @@ def handle_post_stripe_checkout_sessions(app, environ):
             502,
             "bad_gateway",
             "Stripe response missing session id/url",
-            {"stripe_id": session_id or None},
+            {"request_id": request_id, "stripe_id": session_id or None},
         )
 
     if not hasattr(app.storage, "upsert_stripe_link"):
         print(
             json.dumps(
                 {
+                    "request_id": request_id,
                     "provider": "stripe",
                     "decision": "stripe_link_persisted",
                     "stripe_link_persisted": False,
@@ -116,9 +134,15 @@ def handle_post_stripe_checkout_sessions(app, environ):
                 ensure_ascii=False,
             )
         )
-        return error(500, "internal_error", "Storage does not support stripe_links", {})
+        return error(
+            500,
+            "internal_error",
+            "Storage does not support stripe_links",
+            {"request_id": request_id},
+        )
 
     try:
+        # Note: customer_id may be None at this stage. It is still useful to persist session->account mapping.
         app.storage.upsert_stripe_link(  # type: ignore[attr-defined]
             account_id=str(account_id),
             stripe_session_id=session_id,
@@ -127,6 +151,7 @@ def handle_post_stripe_checkout_sessions(app, environ):
         print(
             json.dumps(
                 {
+                    "request_id": request_id,
                     "provider": "stripe",
                     "decision": "stripe_link_persisted",
                     "stripe_link_persisted": True,
@@ -143,6 +168,7 @@ def handle_post_stripe_checkout_sessions(app, environ):
         print(
             json.dumps(
                 {
+                    "request_id": request_id,
                     "provider": "stripe",
                     "decision": "stripe_link_persisted",
                     "stripe_link_persisted": False,
@@ -160,10 +186,33 @@ def handle_post_stripe_checkout_sessions(app, environ):
             500,
             "internal_error",
             "Failed to store stripe link",
-            {"exception": type(ex).__name__, "cause": msg},
+            {"request_id": request_id, "exception": type(ex).__name__, "cause": msg},
         )
 
-    return json_response(200, {"checkout_session": {"id": session_id, "url": session_url}})
+    return json_response(
+        200,
+        {"request_id": request_id, "checkout_session": {"id": session_id, "url": session_url}},
+    )
+
+
+def _extract_account_id_from_metadata(md: object) -> Optional[str]:
+    if not isinstance(md, dict):
+        return None
+    v = md.get("account_id")
+    if isinstance(v, str):
+        v = v.strip()
+        return v or None
+    return None
+
+
+def _extract_price_id_from_metadata(md: object) -> Optional[str]:
+    if not isinstance(md, dict):
+        return None
+    v = md.get("price_id")
+    if isinstance(v, str):
+        v = v.strip()
+        return v or None
+    return None
 
 
 def handle_post_webhooks_stripe(app, environ):
@@ -220,16 +269,8 @@ def handle_post_webhooks_stripe(app, environ):
     if not session_id:
         return error(400, "invalid_request", "Missing session id")
 
-    # Resolve account_id:
-    # 1) prefer metadata.account_id if present
     metadata = data_obj.get("metadata") or {}
-    account_id = None
-    if isinstance(metadata, dict):
-        account_id = metadata.get("account_id")
-        if isinstance(account_id, str):
-            account_id = account_id.strip() or None
-        else:
-            account_id = None
+    account_id = _extract_account_id_from_metadata(metadata)
 
     # 2) fallback to stripe_links lookup
     if not account_id:
@@ -239,14 +280,54 @@ def handle_post_webhooks_stripe(app, environ):
             except Exception:
                 account_id = None
 
+    # 3) final fallback: Stripe API GET session and read metadata.account_id OR client_reference_id
+    fetched_meta_price_id = None
+    fetched_client_ref = None
+    if not account_id:
+        try:
+            secret_key = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
+            if secret_key:
+                url = f"/v1/checkout/sessions/{urllib.parse.quote(session_id)}"
+                obj2, err3 = stripe_api_get_json(secret_key, url)
+                if not err3 and obj2:
+                    md2 = obj2.get("metadata") or {}
+                    account_id = _extract_account_id_from_metadata(md2) or None
+                    fetched_meta_price_id = _extract_price_id_from_metadata(md2) or None
+                    cr = obj2.get("client_reference_id")
+                    if isinstance(cr, str):
+                        fetched_client_ref = cr.strip() or None
+                    if not account_id and fetched_client_ref:
+                        # backup channel: client_reference_id is our token/account_id
+                        account_id = fetched_client_ref
+        except Exception:
+            account_id = None
+
     if not account_id:
         print(
             json.dumps(
-                {"provider": "stripe", "decision": "no_account_resolved", "event_id": event_id, "session_id": session_id},
+                {
+                    "provider": "stripe",
+                    "decision": "no_account_resolved",
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "hint": "missing_metadata_and_stripe_links",
+                },
                 ensure_ascii=False,
             )
         )
         return json_response(200, {"ok": True})
+
+    # Best-effort: persist stripe_links from webhook once we have session_id + account_id (+ customer_id if present)
+    if hasattr(app.storage, "upsert_stripe_link"):
+        try:
+            app.storage.upsert_stripe_link(  # type: ignore[attr-defined]
+                account_id=str(account_id),
+                stripe_session_id=session_id,
+                stripe_customer_id=customer_id,
+            )
+        except Exception:
+            # Do not fail webhook on persistence problems.
+            pass
 
     # Payment must be paid
     if payment_status != "paid":
@@ -258,6 +339,7 @@ def handle_post_webhooks_stripe(app, environ):
                     "event_id": event_id,
                     "session_id": session_id,
                     "payment_status": payment_status,
+                    "account_id": str(account_id),
                 },
                 ensure_ascii=False,
             )
@@ -266,25 +348,7 @@ def handle_post_webhooks_stripe(app, environ):
 
     # Determine credited units from price mapping
     env_price_id = (os.getenv("STRIPE_PRICE_ID_EUR_50") or "").strip()
-    meta_price_id = None
-    if isinstance(metadata, dict):
-        mp = metadata.get("price_id")
-        if isinstance(mp, str):
-            meta_price_id = mp.strip() or None
-
-    # If metadata missing, try Stripe API to obtain line_items (optional)
-    if not meta_price_id:
-        try:
-            secret_key = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
-            if secret_key:
-                url = f"/v1/checkout/sessions/{urllib.parse.quote(session_id)}"
-                obj2, err3 = stripe_api_get_json(secret_key, url)
-                if not err3 and obj2:
-                    md2 = obj2.get("metadata") or {}
-                    if isinstance(md2, dict) and isinstance(md2.get("price_id"), str):
-                        meta_price_id = (md2.get("price_id") or "").strip() or None
-        except Exception:
-            pass
+    meta_price_id = _extract_price_id_from_metadata(metadata) or fetched_meta_price_id
 
     # Canon mapping: use env price id if meta is missing (and treat mismatch as warning)
     price_id_effective = meta_price_id or env_price_id
@@ -292,7 +356,7 @@ def handle_post_webhooks_stripe(app, environ):
     # Default: EUR 50 => 5000 units (canonical)
     credited_units = 5000
 
-    # Allow MIN_TOPUP_USDT mapping if you later add USDT mode; keep for future compatibility
+    # Keep for future compatibility (USDT mode placeholder)
     if isinstance(MIN_TOPUP_USDT, Decimal) and MIN_TOPUP_USDT > 0:
         _ = _to_int_units(MIN_TOPUP_USDT)
 
@@ -316,6 +380,12 @@ def handle_post_webhooks_stripe(app, environ):
                         "meta_price_id": meta_price_id,
                         "env_price_id": env_price_id,
                         "price_id_effective": price_id_effective,
+                        "account_id_source": (
+                            "metadata"
+                            if _extract_account_id_from_metadata(metadata)
+                            else ("stripe_links" if hasattr(app.storage, "resolve_account_by_stripe_session") else "stripe_api_get")
+                        ),
+                        "fetched_client_reference_id": fetched_client_ref,
                     },
                     ensure_ascii=False,
                 ),
