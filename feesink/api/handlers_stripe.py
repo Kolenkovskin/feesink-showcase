@@ -1,5 +1,5 @@
 # file: feesink/api/handlers_stripe.py
-# FEESINK-API-HANDLERS-STRIPE v2026.01.20-01
+# FEESINK-API-HANDLERS-STRIPE v2026.01.20-02
 
 from __future__ import annotations
 
@@ -65,6 +65,9 @@ def handle_post_stripe_checkout_sessions(app, environ):
         return error(401, "unauthorized", "Missing Bearer token", {"request_id": request_id})
 
     account_id = _token_to_account_id(token)
+
+    # P0 guard: checkout_session without account_id is forbidden
+    assert account_id, "checkout_session without account_id is forbidden"
 
     secret_key = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
     price_id = (os.getenv("STRIPE_PRICE_ID_EUR_50") or "").strip()
@@ -256,7 +259,12 @@ def handle_post_webhooks_stripe(app, environ):
     except Exception as ex:
         print(
             json.dumps(
-                {"provider": "stripe", "decision": "provider_event_store_fail", "event_id": event_id, "exc": type(ex).__name__},
+                {
+                    "provider": "stripe",
+                    "decision": "provider_event_store_fail",
+                    "event_id": event_id,
+                    "exc": type(ex).__name__,
+                },
                 ensure_ascii=False,
             )
         )
@@ -277,7 +285,22 @@ def handle_post_webhooks_stripe(app, environ):
         if hasattr(app.storage, "resolve_account_by_stripe_session"):
             try:
                 account_id = app.storage.resolve_account_by_stripe_session(session_id)  # type: ignore[attr-defined]
-            except Exception:
+            except Exception as ex:
+                msg = str(ex).replace("\n", "\\n")
+                print(
+                    json.dumps(
+                        {
+                            "provider": "stripe",
+                            "decision": "resolve_account_by_stripe_session_fail",
+                            "event_id": event_id,
+                            "session_id": session_id,
+                            "exc_type": type(ex).__name__,
+                            "exc_msg": msg,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                print(traceback.format_exc())
                 account_id = None
 
     # 3) final fallback: Stripe API GET session and read metadata.account_id OR client_reference_id
@@ -405,6 +428,7 @@ def handle_post_webhooks_stripe(app, environ):
                 )
             )
     except Exception as ex:
+        msg = str(ex).replace("\n", "\\n")
         print(
             json.dumps(
                 {
@@ -414,9 +438,11 @@ def handle_post_webhooks_stripe(app, environ):
                     "session_id": session_id,
                     "account_id": str(account_id),
                     "exc_type": type(ex).__name__,
+                    "exc_msg": msg,
                 },
                 ensure_ascii=False,
             )
         )
+        print(traceback.format_exc())
 
     return json_response(200, {"ok": True})
