@@ -1,5 +1,5 @@
-# feesink/api/handlers_stripe.py
-# FEESINK-API-HANDLERS-STRIPE v2026.01.20-03
+# file: feesink/api/handlers_stripe.py
+# FEESINK-API-HANDLERS-STRIPE v2026.01.21-01
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from feesink.api._stripe import (
     stripe_verify_signature,
 )
 from feesink.config.canon import MIN_TOPUP_USDT, USDT_TO_UNITS_RATE
+from feesink.domain.models import TopUp
 
 
 def _now_utc() -> datetime:
@@ -39,70 +40,30 @@ def _require_self_issued_token(environ) -> str:
     """
     token = (get_bearer_token(environ) or "").strip()
     if not token:
-        raise ValueError("missing_token")
+        raise ValueError("missing bearer token")
     return token
 
 
 def _token_to_account_id(token: str) -> str:
-    # canon: token == account_id
-    return token
+    # Canon: token == account_id (self-issued)
+    return token.strip()
 
 
-def _to_int_units(amount_usdt: Decimal) -> int:
-    # 1 USDT -> USDT_TO_UNITS_RATE units
-    # Use quantize via int() after multiplication.
-    return int((amount_usdt * USDT_TO_UNITS_RATE).to_integral_value())
-
-
-def _safe_storage_db_path(app) -> Optional[str]:
+def handle_post_stripe_checkout_sessions(environ, app) -> dict:
     """
-    Best-effort introspection to prove which DB the service is writing to.
-    We do NOT enforce any structure here (no brittle invariants).
+    POST /v1/stripe/checkout_sessions
+
+    Creates a Stripe Checkout Session for a self-issued token (token == account_id)
+    and persists stripe_links mapping (stripe_session_id -> account_id).
+
+    Price is taken ONLY from ENV STRIPE_PRICE_ID_EUR_50.
     """
-    try:
-        st = getattr(app, "storage", None)
-        if st is None:
-            return None
-        schema = getattr(st, "_schema", None)
-        if schema is None:
-            return None
-        cfg = getattr(schema, "_config", None)
-        if cfg is None:
-            return None
-        v = getattr(cfg, "db_path", None)
-        if isinstance(v, str):
-            v = v.strip()
-            return v or None
-        return None
-    except Exception:
-        return None
-
-
-def _jlog(payload: dict) -> None:
-    """
-    Deterministic JSON log with flush=True.
-    Render may buffer stdout; flush reduces "invisible logs" risk.
-    """
-    print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
-
-
-def handle_post_stripe_checkout_sessions(app, environ):
     now = _now_utc()
     request_id = _new_request_id(now)
-    db_path = _safe_storage_db_path(app)
 
-    # Requires Authorization: Bearer <token>
     try:
         token = _require_self_issued_token(environ)
-    except ValueError:
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "reject_missing_bearer",
-                "request_id": request_id,
-                "db_path": db_path,
-            }
-        )
+    except Exception:
         return error(401, "unauthorized", "Missing Bearer token", {"request_id": request_id})
 
     account_id = _token_to_account_id(token)
@@ -124,38 +85,26 @@ def handle_post_stripe_checkout_sessions(app, environ):
     if not cancel_url:
         return error(500, "internal_error", "STRIPE_CANCEL_URL is not set", {"request_id": request_id})
 
+    # Put token into success url for a user-friendly confirmation page (landing)
+    success_url = success_url
+    cancel_url = cancel_url
+
+    metadata = {"account_id": account_id, "price_id": price_id}
+
     form = {
         "mode": "payment",
         "success_url": success_url,
         "cancel_url": cancel_url,
         "line_items[0][price]": price_id,
         "line_items[0][quantity]": "1",
-        # Backup channel: Stripe exposes client_reference_id directly in session
-        "client_reference_id": str(account_id),
-        # Primary channel: metadata for our webhook
-        "metadata[token]": token,
-        "metadata[account_id]": str(account_id),
-        "metadata[price_id]": str(price_id),
+        "metadata[account_id]": account_id,
+        "metadata[price_id]": price_id,
     }
 
-    obj, err2 = stripe_api_post_form(secret_key, "/v1/checkout/sessions", form)
-    if err2 or not obj:
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "stripe_create_failed",
-                "request_id": request_id,
-                "db_path": db_path,
-                "reason": err2,
-                "account_id": str(account_id),
-            }
-        )
-        return error(
-            502,
-            "bad_gateway",
-            "Stripe request failed",
-            {"request_id": request_id, "reason": err2},
-        )
+    try:
+        obj = stripe_api_post_form(secret_key, "/v1/checkout/sessions", form)
+    except Exception as ex:
+        return error(502, "bad_gateway", "Stripe API failed", {"request_id": request_id, "exc": str(ex)})
 
     session_id = (obj.get("id") or "").strip()
     session_url = (obj.get("url") or "").strip()
@@ -166,374 +115,356 @@ def handle_post_stripe_checkout_sessions(app, environ):
         customer_id = None
 
     if not session_id or not session_url:
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "stripe_response_missing_id_or_url",
-                "request_id": request_id,
-                "db_path": db_path,
-                "stripe_id": session_id or None,
-                "account_id": str(account_id),
-            }
-        )
         return error(
             502,
             "bad_gateway",
-            "Stripe response missing session id/url",
-            {"request_id": request_id, "stripe_id": session_id or None},
+            "Stripe returned an invalid checkout session",
+            {"request_id": request_id, "stripe": {"id": session_id, "url": session_url}},
         )
 
-    if not hasattr(app.storage, "upsert_stripe_link"):
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "stripe_link_persisted",
-                "stripe_link_persisted": False,
-                "reason": "storage_missing_method",
-                "request_id": request_id,
-                "db_path": db_path,
-                "session_id": session_id,
-                "account_id": str(account_id),
-            }
-        )
-        return error(
-            500,
-            "internal_error",
-            "Storage does not support stripe_links",
-            {"request_id": request_id},
-        )
-
+    stripe_link_persisted = False
     try:
-        # Note: customer_id may be None at this stage. It is still useful to persist session->account mapping.
-        app.storage.upsert_stripe_link(  # type: ignore[attr-defined]
-            account_id=str(account_id),
+        app.storage.upsert_stripe_link(
             stripe_session_id=session_id,
             stripe_customer_id=customer_id,
+            account_id=account_id,
         )
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "stripe_link_persisted",
-                "stripe_link_persisted": True,
-                "request_id": request_id,
-                "db_path": db_path,
-                "session_id": session_id,
-                "account_id": str(account_id),
-                "customer_id": customer_id,
-            }
-        )
+        stripe_link_persisted = True
     except Exception as ex:
-        # Critical: log the real cause (one-line JSON + traceback)
-        msg = str(ex).replace("\n", "\\n")
-        _jlog(
+        # Do not hide this; it blocks webhook->account resolution.
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "stripe_link_persist_fail",
+                    "session_id": session_id,
+                    "customer_id": customer_id,
+                    "account_id": account_id,
+                    "db_path": getattr(getattr(getattr(app.storage, "_schema", None), "_config", None), "db_path", None),
+                    "exc": type(ex).__name__,
+                    "traceback": traceback.format_exc(limit=30),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return error(500, "internal_error", "Failed to store stripe link", {"request_id": request_id})
+
+    # Log for deterministic correlation
+    print(
+        json.dumps(
             {
                 "provider": "stripe",
-                "decision": "stripe_link_persisted",
-                "stripe_link_persisted": False,
                 "request_id": request_id,
-                "db_path": db_path,
+                "decision": "stripe_link_persisted",
                 "session_id": session_id,
-                "account_id": str(account_id),
                 "customer_id": customer_id,
-                "exc_type": type(ex).__name__,
-                "exc_msg": msg,
-            }
-        )
-        print(traceback.format_exc(), flush=True)
-        return error(
-            500,
-            "internal_error",
-            "Failed to store stripe link",
-            {"request_id": request_id, "exception": type(ex).__name__, "cause": msg},
-        )
+                "account_id": account_id,
+                "stripe_link_persisted": stripe_link_persisted,
+                "db_path": getattr(getattr(getattr(app.storage, "_schema", None), "_config", None), "db_path", None),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
     return json_response(
         200,
-        {"request_id": request_id, "checkout_session": {"id": session_id, "url": session_url}},
+        {
+            "request_id": request_id,
+            "checkout_session": {"id": session_id, "url": session_url},
+        },
     )
 
 
-def _extract_account_id_from_metadata(md: object) -> Optional[str]:
-    if not isinstance(md, dict):
-        return None
-    v = md.get("account_id")
-    if isinstance(v, str):
-        v = v.strip()
-        return v or None
-    return None
+def handle_post_webhooks_stripe(environ, app) -> dict:
+    """
+    POST /v1/webhooks/stripe
 
+    Handles Stripe webhooks, currently focusing on:
+    - checkout.session.completed (paid)
 
-def _extract_price_id_from_metadata(md: object) -> Optional[str]:
-    if not isinstance(md, dict):
-        return None
-    v = md.get("price_id")
-    if isinstance(v, str):
-        v = v.strip()
-        return v or None
-    return None
-
-
-def handle_post_webhooks_stripe(app, environ):
+    Chain:
+    checkout.session.completed -> resolve account_id -> credit_topup(tx_hash=stripe:evt_...) -> balance_units increases
+    """
     now = _now_utc()
     request_id = _new_request_id(now)
-    db_path = _safe_storage_db_path(app)
 
-    whsec = (os.getenv("STRIPE_WEBHOOK_SECRET") or "").strip()
-    sig_header = (environ.get("HTTP_STRIPE_SIGNATURE") or "").strip()
-    raw = read_raw_body(environ)
-
-    if not stripe_verify_signature(raw, sig_header, whsec):
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "signature_fail",
-                "request_id": request_id,
-                "db_path": db_path,
-            }
-        )
-        return error(400, "invalid_signature", "Invalid Stripe signature")
+    secret = (os.getenv("STRIPE_WEBHOOK_SECRET") or "").strip()
+    if not secret:
+        return error(500, "internal_error", "STRIPE_WEBHOOK_SECRET is not set", {"request_id": request_id})
 
     try:
-        event = json.loads(raw.decode("utf-8"))
+        raw_body = read_raw_body(environ)
     except Exception:
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "invalid_json",
-                "request_id": request_id,
-                "db_path": db_path,
-            }
-        )
-        return error(400, "invalid_request", "Invalid JSON body")
+        return error(400, "bad_request", "Missing request body", {"request_id": request_id})
 
-    event_id = (event.get("id") or "").strip() or None
-    event_type = (event.get("type") or "").strip() or None
-    if not event_id:
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "missing_event_id",
-                "request_id": request_id,
-                "db_path": db_path,
-            }
-        )
-        return error(400, "invalid_request", "Missing Stripe event id")
+    sig = environ.get("HTTP_STRIPE_SIGNATURE")
+    if not sig:
+        return error(400, "bad_request", "Missing Stripe-Signature header", {"request_id": request_id})
 
-    if event_type != "checkout.session.completed":
-        _jlog(
+    try:
+        evt = stripe_verify_signature(secret, raw_body, sig)
+    except Exception as ex:
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "signature_verify_fail",
+                    "exc": type(ex).__name__,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return error(400, "bad_request", "Invalid signature", {"request_id": request_id})
+
+    if not isinstance(evt, dict):
+        return error(400, "bad_request", "Invalid event payload", {"request_id": request_id})
+
+    event_id = (evt.get("id") or "").strip()
+    event_type = (evt.get("type") or "").strip()
+
+    # Parse object
+    data_obj = (((evt.get("data") or {}).get("object") or {}) if isinstance(evt.get("data"), dict) else {})
+    session_id = (data_obj.get("id") or "").strip()
+    payment_status = (data_obj.get("payment_status") or "").strip()
+    metadata = data_obj.get("metadata") or {}
+    meta_account_id = None
+    meta_price_id = None
+    if isinstance(metadata, dict):
+        meta_account_id = (metadata.get("account_id") or "").strip() or None
+        meta_price_id = (metadata.get("price_id") or "").strip() or None
+
+    # Always log receipt (key fields)
+    print(
+        json.dumps(
             {
                 "provider": "stripe",
-                "decision": "ignored_event",
                 "request_id": request_id,
-                "db_path": db_path,
+                "decision": "webhook_received",
                 "event_id": event_id,
                 "event_type": event_type,
-            }
-        )
-        return json_response(200, {"ok": True, "ignored": True})
+                "session_id": session_id,
+                "payment_status": payment_status,
+                "meta_account_id": meta_account_id,
+                "meta_price_id": meta_price_id,
+                "db_path": getattr(getattr(getattr(app.storage, "_schema", None), "_config", None), "db_path", None),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
-    # Store provider event payload (idempotent)
-    try:
-        if hasattr(app.storage, "insert_provider_event"):
-            app.storage.insert_provider_event(  # type: ignore[attr-defined]
-                provider="stripe",
-                provider_event_id=event_id,
-                event_type=event_type or "unknown",
-                raw_json=raw.decode("utf-8"),
-                received_at_utc=utc_iso(_now_utc()),
-            )
-    except Exception as ex:
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "provider_event_store_fail",
-                "request_id": request_id,
-                "db_path": db_path,
-                "event_id": event_id,
-                "exc": type(ex).__name__,
-            }
+    if event_type != "checkout.session.completed":
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "ignored_event",
+                    "event_id": event_id,
+                    "event_type": event_type,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
         )
-
-    data_obj = (((event.get("data") or {}).get("object")) or {})
-    session_id = (data_obj.get("id") or "").strip() or None
-    payment_status = (data_obj.get("payment_status") or "").strip() or None
-    customer_id = (data_obj.get("customer") or "").strip() if isinstance(data_obj.get("customer"), str) else None
+        return json_response(200, {"ok": True})
 
     if not session_id:
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "missing_session_id",
-                "request_id": request_id,
-                "db_path": db_path,
-                "event_id": event_id,
-            }
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "missing_session_id",
+                    "event_id": event_id,
+                    "event_type": event_type,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
         )
-        return error(400, "invalid_request", "Missing session id")
+        return json_response(200, {"ok": True})
 
-    metadata = data_obj.get("metadata") or {}
-    account_id = _extract_account_id_from_metadata(metadata)
+    if payment_status != "paid":
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "not_paid",
+                    "event_id": event_id,
+                    "event_type": event_type,
+                    "session_id": session_id,
+                    "payment_status": payment_status,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return json_response(200, {"ok": True})
 
-    # 2) fallback to stripe_links lookup
-    if not account_id:
-        if hasattr(app.storage, "resolve_account_by_stripe_session"):
-            try:
-                account_id = app.storage.resolve_account_by_stripe_session(session_id)  # type: ignore[attr-defined]
-            except Exception as ex:
-                msg = str(ex).replace("\n", "\\n")
-                _jlog(
-                    {
-                        "provider": "stripe",
-                        "decision": "resolve_account_by_stripe_session_fail",
-                        "request_id": request_id,
-                        "db_path": db_path,
-                        "event_id": event_id,
-                        "session_id": session_id,
-                        "exc_type": type(ex).__name__,
-                        "exc_msg": msg,
-                    }
-                )
-                print(traceback.format_exc(), flush=True)
-                account_id = None
+    # Store provider event payload (best-effort, idempotent by provider_event_id)
+    try:
+        # IMPORTANT: storage contract accepts ONLY (provider, provider_event_id, raw_json)
+        app.storage.insert_provider_event(
+            provider="stripe",
+            provider_event_id=event_id,
+            raw_json=json.dumps(evt, ensure_ascii=False),
+        )
+    except Exception as ex:
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "provider_event_store_fail",
+                    "event_id": event_id,
+                    "exc": type(ex).__name__,
+                    "traceback": traceback.format_exc(limit=30),
+                    "db_path": getattr(getattr(getattr(app.storage, "_schema", None), "_config", None), "db_path", None),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
-    # 3) final fallback: Stripe API GET session and read metadata.account_id OR client_reference_id
-    fetched_meta_price_id = None
-    fetched_client_ref = None
+    # Resolve account_id:
+    account_id = meta_account_id
+    resolved_by = "metadata"
     if not account_id:
         try:
-            secret_key = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
-            if secret_key:
-                url = f"/v1/checkout/sessions/{urllib.parse.quote(session_id)}"
-                obj2, err3 = stripe_api_get_json(secret_key, url)
-                if not err3 and obj2:
-                    md2 = obj2.get("metadata") or {}
-                    account_id = _extract_account_id_from_metadata(md2) or None
-                    fetched_meta_price_id = _extract_price_id_from_metadata(md2) or None
-                    cr = obj2.get("client_reference_id")
-                    if isinstance(cr, str):
-                        fetched_client_ref = cr.strip() or None
-                    if not account_id and fetched_client_ref:
-                        # backup channel: client_reference_id is our token/account_id
-                        account_id = fetched_client_ref
-        except Exception:
+            account_id = app.storage.resolve_account_by_stripe_session(session_id)
+            if account_id:
+                resolved_by = "stripe_links"
+        except Exception as ex:
+            print(
+                json.dumps(
+                    {
+                        "provider": "stripe",
+                        "request_id": request_id,
+                        "decision": "resolve_account_fail",
+                        "event_id": event_id,
+                        "session_id": session_id,
+                        "exc": type(ex).__name__,
+                        "traceback": traceback.format_exc(limit=30),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
             account_id = None
 
     if not account_id:
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "no_account_resolved",
-                "request_id": request_id,
-                "db_path": db_path,
-                "event_id": event_id,
-                "session_id": session_id,
-                "hint": "missing_metadata_and_stripe_links",
-            }
-        )
-        return json_response(200, {"ok": True})
-
-    # Best-effort: persist stripe_links from webhook once we have session_id + account_id (+ customer_id if present)
-    if hasattr(app.storage, "upsert_stripe_link"):
-        try:
-            app.storage.upsert_stripe_link(  # type: ignore[attr-defined]
-                account_id=str(account_id),
-                stripe_session_id=session_id,
-                stripe_customer_id=customer_id,
-            )
-        except Exception:
-            # Do not fail webhook on persistence problems.
-            pass
-
-    # Payment must be paid
-    if payment_status != "paid":
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "not_paid",
-                "request_id": request_id,
-                "db_path": db_path,
-                "event_id": event_id,
-                "session_id": session_id,
-                "payment_status": payment_status,
-                "account_id": str(account_id),
-            }
-        )
-        return json_response(200, {"ok": True})
-
-    # Determine credited units from price mapping
-    env_price_id = (os.getenv("STRIPE_PRICE_ID_EUR_50") or "").strip()
-    meta_price_id = _extract_price_id_from_metadata(metadata) or fetched_meta_price_id
-
-    # Canon mapping: use env price id if meta is missing (and treat mismatch as warning)
-    price_id_effective = meta_price_id or env_price_id
-
-    # Default: EUR 50 => 5000 units (canonical)
-    credited_units = 5000
-
-    # Keep for future compatibility (USDT mode placeholder)
-    if isinstance(MIN_TOPUP_USDT, Decimal) and MIN_TOPUP_USDT > 0:
-        _ = _to_int_units(MIN_TOPUP_USDT)
-
-    # Idempotency key based on provider event id
-    tx_hash = f"stripe:{event_id}"
-
-    # Credit account
-    try:
-        if hasattr(app.storage, "credit_account"):
-            res = app.storage.credit_account(  # type: ignore[attr-defined]
-                account_id=str(account_id),
-                credited_units=int(credited_units),
-                provider="stripe",
-                provider_event_id=event_id,
-                tx_hash=tx_hash,
-                meta_json=json.dumps(
-                    {
-                        "event_type": event_type,
-                        "session_id": session_id,
-                        "customer_id": customer_id,
-                        "meta_price_id": meta_price_id,
-                        "env_price_id": env_price_id,
-                        "price_id_effective": price_id_effective,
-                        "account_id_source": (
-                            "metadata"
-                            if _extract_account_id_from_metadata(metadata)
-                            else ("stripe_links" if hasattr(app.storage, "resolve_account_by_stripe_session") else "stripe_api_get")
-                        ),
-                        "fetched_client_reference_id": fetched_client_ref,
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-            _jlog(
+        print(
+            json.dumps(
                 {
                     "provider": "stripe",
-                    "decision": "credited",
                     "request_id": request_id,
-                    "db_path": db_path,
+                    "decision": "no_account_resolved",
                     "event_id": event_id,
                     "session_id": session_id,
-                    "account_id": str(account_id),
-                    "credited_units": int(credited_units),
-                    "tx_hash": tx_hash,
-                    "inserted": bool(getattr(res, "inserted", True)),
-                }
-            )
-    except Exception as ex:
-        msg = str(ex).replace("\n", "\\n")
-        _jlog(
-            {
-                "provider": "stripe",
-                "decision": "credit_fail",
-                "request_id": request_id,
-                "db_path": db_path,
-                "event_id": event_id,
-                "session_id": session_id,
-                "account_id": str(account_id),
-                "tx_hash": tx_hash,
-                "exc_type": type(ex).__name__,
-                "exc_msg": msg,
-            }
+                    "meta_account_id": meta_account_id,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
         )
-        print(traceback.format_exc(), flush=True)
+        return json_response(200, {"ok": True})
+
+    # Credit decision: fixed pack mapping (current canon: EUR 50 => 5000 units)
+    # (We keep it deterministic and avoid extra lookups.)
+    credited_units = 5000
+    tx_hash = f"stripe:{event_id}"
+
+    if not hasattr(app.storage, "credit_topup"):
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "credit_missing_impl",
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "account_id": account_id,
+                    "resolved_by": resolved_by,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return json_response(200, {"ok": True})
+
+    try:
+        topup = TopUp(
+            account_id=account_id,
+            tx_hash=tx_hash,
+            amount_usdt=Decimal("0"),
+            credited_units=credited_units,
+            ts=now,
+        )
+        res = app.storage.credit_topup(topup)
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "credited",
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "account_id": account_id,
+                    "resolved_by": resolved_by,
+                    "tx_hash": tx_hash,
+                    "credited_units": credited_units,
+                    "credit_result": {
+                        "ok": getattr(res, "ok", None),
+                        "decision": getattr(res, "decision", None),
+                        "credited_units": getattr(res, "credited_units", None),
+                        "balance_units": getattr(res, "balance_units", None),
+                        "topup_id": getattr(res, "topup_id", None),
+                        "account_id": getattr(res, "account_id", None),
+                    },
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    except Exception as ex:
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "credit_fail",
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "account_id": account_id,
+                    "resolved_by": resolved_by,
+                    "tx_hash": tx_hash,
+                    "credited_units": credited_units,
+                    "exc": type(ex).__name__,
+                    "traceback": traceback.format_exc(limit=40),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     return json_response(200, {"ok": True})
