@@ -19,7 +19,7 @@ from feesink.api.app import FeeSinkApiApp
 # Version banner (must print at startup)
 # ----------------------------
 
-API_VERSION = "FEESINK-API-APP v2026.01.19-01"
+API_VERSION = "FEESINK-API-APP v2026.01.22-01"
 
 
 def _safe_getattr(mod, name: str, default: str) -> str:
@@ -35,7 +35,6 @@ def _sha256_hex_prefix(s: str, n: int = 8) -> str:
 
 def _get_listen_host() -> str:
     # Render must bind on 0.0.0.0 to expose the service publicly.
-    # Allow override, but default to 0.0.0.0.
     return (os.getenv("FEESINK_API_HOST") or "0.0.0.0").strip()
 
 
@@ -127,11 +126,6 @@ def _print_startup_banner() -> None:
 
 
 def _landing_html(api_version: str) -> bytes:
-    # Public landing:
-    # - explain self-issued token
-    # - generate token client-side (no server state)
-    # - create Stripe Checkout Session via POST /v1/stripe/checkout_sessions
-    # - redirect to Stripe url
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -257,6 +251,14 @@ def _landing_html(api_version: str) -> bytes:
     return b64.replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, "");
   }}
 
+  function newRequestId() {{
+    // Best-effort, browser-side correlation id
+    try {{
+      if (window.crypto && crypto.randomUUID) return "rid_" + crypto.randomUUID();
+    }} catch (e) {{}}
+    return "rid_" + String(Date.now()) + "_" + String(Math.floor(Math.random()*1e9));
+  }}
+
   function generateToken() {{
     if (!window.crypto || !crypto.getRandomValues) {{
       show("err", "Crypto RNG is not available in this browser.");
@@ -290,13 +292,16 @@ def _landing_html(api_version: str) -> bytes:
       return;
     }}
 
-    show("ok", "Creating Stripe Checkout Session...");
+    var requestId = newRequestId();
+    show("ok", "Creating Stripe Checkout Session...\\nrequest_id: " + requestId);
+
     try {{
       var resp = await fetch("/v1/stripe/checkout_sessions", {{
         method: "POST",
         headers: {{
           "Authorization": "Bearer " + token,
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
+          "X-Feesink-Request-Id": requestId
         }},
         body: "{{}}"
       }});
@@ -306,23 +311,28 @@ def _landing_html(api_version: str) -> bytes:
       try {{ data = JSON.parse(text); }} catch (e) {{ data = null; }}
 
       if (!resp.ok) {{
+        var msg = "Error: HTTP " + resp.status + "\\n";
         if (data && data.error) {{
-          show("err", "Error: " + (data.error.code || "unknown") + "\\n" + (data.error.message || ""));
+          msg += (data.error.code || "unknown") + "\\n" + (data.error.message || "");
+          if (data.error.details && data.error.details.request_id) {{
+            msg += "\\nrequest_id: " + data.error.details.request_id;
+          }}
         }} else {{
-          show("err", "Error: HTTP " + resp.status + "\\n" + text);
+          msg += text;
         }}
+        show("err", msg);
         return;
       }}
 
       var url = data && data.checkout_session && data.checkout_session.url;
       if (!url) {{
-        show("err", "Error: missing checkout_session.url");
+        show("err", "Error: missing checkout_session.url\\nrequest_id: " + requestId);
         return;
       }}
 
       window.location.href = url;
     }} catch (e) {{
-      show("err", "Network error: " + (e && e.message ? e.message : String(e)));
+      show("err", "Network error: " + (e && e.message ? e.message : String(e)) + "\\nrequest_id: " + requestId);
     }}
   }}
 
@@ -345,7 +355,6 @@ def _landing_html(api_version: str) -> bytes:
 
 
 def _wsgi_app(environ, start_response, inner_app):
-    # Serve landing at "/" to avoid confusing 404 on the product URL.
     path = (environ.get("PATH_INFO") or "").strip()
     if path == "" or path == "/":
         body = _landing_html(API_VERSION)
