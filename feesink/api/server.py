@@ -300,6 +300,7 @@ def _landing_html(api_version: str) -> bytes:
         method: "POST",
         headers: {{
           "Authorization": "Bearer " + token,
+          "X-Feesink-Token": token,
           "Content-Type": "application/json",
           "X-Feesink-Request-Id": requestId
         }},
