@@ -1,5 +1,5 @@
 # file: feesink/api/handlers_stripe.py
-# FEESINK-API-HANDLERS-STRIPE v2026.01.22-03
+# FEESINK-API-HANDLERS-STRIPE v2026.01.23-01
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def _token_to_account_id(token: str) -> str:
     return token.strip()
 
 
-def handle_post_stripe_checkout_sessions(app, environ):
+def handle_post_stripe_checkout_sessions(app, environ) -> dict:
     """
     POST /v1/stripe/checkout_sessions
 
@@ -89,7 +89,6 @@ def handle_post_stripe_checkout_sessions(app, environ):
 
     session_id = (obj.get("id") or "").strip()
     session_url = (obj.get("url") or "").strip()
-
     customer_id = obj.get("customer")
     if isinstance(customer_id, str):
         customer_id = customer_id.strip()
@@ -104,7 +103,6 @@ def handle_post_stripe_checkout_sessions(app, environ):
             {"request_id": request_id},
         )
 
-    # Best-effort store stripe link (do not block payment URL)
     stripe_link_persisted = False
     try:
         app.storage.upsert_stripe_link(
@@ -132,6 +130,7 @@ def handle_post_stripe_checkout_sessions(app, environ):
             ),
             flush=True,
         )
+        # Still return URL so user can pay; webhook can credit using metadata.
 
     return json_response(
         200,
@@ -143,7 +142,7 @@ def handle_post_stripe_checkout_sessions(app, environ):
     )
 
 
-def handle_post_webhooks_stripe(app, environ):
+def handle_post_webhooks_stripe(app, environ) -> dict:
     """
     POST /v1/webhooks/stripe
 
@@ -172,11 +171,8 @@ def handle_post_webhooks_stripe(app, environ):
         return error(400, "bad_request", "Missing Stripe-Signature header", {"request_id": request_id})
 
     try:
-        ok = stripe_verify_signature(raw_body, sig, secret)
+        evt = stripe_verify_signature(secret, raw_body, sig)
     except Exception:
-        ok = False
-
-    if not ok:
         print(
             json.dumps(
                 {
@@ -193,11 +189,6 @@ def handle_post_webhooks_stripe(app, environ):
             flush=True,
         )
         return error(400, "bad_request", "Invalid signature", {"request_id": request_id})
-
-    try:
-        evt = json.loads(raw_body.decode("utf-8"))
-    except Exception:
-        return error(400, "bad_request", "Invalid JSON", {"request_id": request_id})
 
     if not isinstance(evt, dict):
         return error(400, "bad_request", "Invalid event payload", {"request_id": request_id})
@@ -275,7 +266,7 @@ def handle_post_webhooks_stripe(app, environ):
         )
         return json_response(200, {"ok": True})
 
-    # provider_event store (best-effort; do not block credit)
+    # provider_event store (fail-hard)
     try:
         app.storage.insert_provider_event(
             provider="stripe",
@@ -298,6 +289,12 @@ def handle_post_webhooks_stripe(app, environ):
                 sort_keys=True,
             ),
             flush=True,
+        )
+        return error(
+            500,
+            "internal_error",
+            "Failed to store provider event",
+            {"request_id": request_id, "event_id": event_id, "decision": "provider_event_store_fail"},
         )
 
     # Resolve account_id
@@ -355,6 +352,35 @@ def handle_post_webhooks_stripe(app, environ):
             {"request_id": request_id, "event_id": event_id, "decision": "no_account_resolved"},
         )
 
+    # P0 FIX: ensure account exists BEFORE credit_topup (webhook может прийти раньше любых API вызовов с токеном)
+    try:
+        app.storage.ensure_account(account_id)
+    except Exception:
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "ensure_account_fail",
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "account_id": account_id,
+                    "resolved_by": resolved_by,
+                    "traceback": traceback.format_exc(limit=80),
+                    "db_path": db_path,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return error(
+            500,
+            "internal_error",
+            "Failed to ensure account",
+            {"request_id": request_id, "event_id": event_id, "decision": "ensure_account_fail"},
+        )
+
     credited_units = 5000
     tx_hash = f"stripe:{event_id}"
 
@@ -366,16 +392,21 @@ def handle_post_webhooks_stripe(app, environ):
             credited_units=credited_units,
             ts=now,
         )
+
         res = app.storage.credit_topup(topup)
 
-        ok2 = bool(getattr(res, "ok", False))
-        if not ok2:
+        inserted = getattr(res, "inserted", None)
+        res_account_id = getattr(res, "account_id", None)
+        res_balance_units = getattr(res, "balance_units", None)
+        res_credited_units = getattr(res, "credited_units", None)
+
+        if inserted is None:
             print(
                 json.dumps(
                     {
                         "provider": "stripe",
                         "request_id": request_id,
-                        "decision": "credit_not_ok",
+                        "decision": "credit_result_invalid",
                         "event_id": event_id,
                         "session_id": session_id,
                         "account_id": account_id,
@@ -383,12 +414,11 @@ def handle_post_webhooks_stripe(app, environ):
                         "tx_hash": tx_hash,
                         "credited_units": credited_units,
                         "credit_result": {
-                            "ok": getattr(res, "ok", None),
-                            "decision": getattr(res, "decision", None),
-                            "credited_units": getattr(res, "credited_units", None),
-                            "balance_units": getattr(res, "balance_units", None),
-                            "topup_id": getattr(res, "topup_id", None),
-                            "account_id": getattr(res, "account_id", None),
+                            "type": type(res).__name__ if res is not None else None,
+                            "inserted": inserted,
+                            "account_id": res_account_id,
+                            "credited_units": res_credited_units,
+                            "balance_units": res_balance_units,
                         },
                         "db_path": db_path,
                     },
@@ -400,16 +430,18 @@ def handle_post_webhooks_stripe(app, environ):
             return error(
                 500,
                 "internal_error",
-                "Credit did not succeed",
-                {"request_id": request_id, "event_id": event_id, "tx_hash": tx_hash, "decision": "credit_not_ok"},
+                "Credit result invalid",
+                {"request_id": request_id, "event_id": event_id, "tx_hash": tx_hash, "decision": "credit_result_invalid"},
             )
+
+        decision = "credited" if inserted else "dedup_already_credited"
 
         print(
             json.dumps(
                 {
                     "provider": "stripe",
                     "request_id": request_id,
-                    "decision": "credited",
+                    "decision": decision,
                     "event_id": event_id,
                     "session_id": session_id,
                     "account_id": account_id,
@@ -417,20 +449,19 @@ def handle_post_webhooks_stripe(app, environ):
                     "tx_hash": tx_hash,
                     "credited_units": credited_units,
                     "credit_result": {
-                        "ok": getattr(res, "ok", None),
-                        "decision": getattr(res, "decision", None),
-                        "credited_units": getattr(res, "credited_units", None),
-                        "balance_units": getattr(res, "balance_units", None),
-                        "topup_id": getattr(res, "topup_id", None),
-                        "account_id": getattr(res, "account_id", None),
+                        "inserted": inserted,
+                        "account_id": res_account_id,
+                        "credited_units": res_credited_units,
+                        "balance_units": res_balance_units,
                     },
+                    "db_path": db_path,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             ),
             flush=True,
         )
-        return json_response(200, {"ok": True, "request_id": request_id, "tx_hash": tx_hash})
+        return json_response(200, {"ok": True, "request_id": request_id, "tx_hash": tx_hash, "decision": decision})
 
     except Exception:
         print(
@@ -461,7 +492,7 @@ def handle_post_webhooks_stripe(app, environ):
         )
 
 
-def handle_get_stripe_success(app, environ):
+def handle_get_stripe_success(app, environ) -> dict:
     qs = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
     account_id = (qs.get("account_id", [""])[0] or "").strip()
     request_id = (qs.get("request_id", [""])[0] or "").strip()
@@ -480,5 +511,5 @@ def handle_get_stripe_success(app, environ):
     )
 
 
-def handle_get_stripe_cancel(app, environ):
+def handle_get_stripe_cancel(app, environ) -> dict:
     return json_response(200, {"ok": True})
