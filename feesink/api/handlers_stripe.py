@@ -39,7 +39,6 @@ def handle_post_stripe_checkout_sessions(app, environ) -> dict:
     POST /v1/stripe/checkout_sessions
 
     Creates a Stripe Checkout Session for a self-issued token (token == account_id).
-
     Price is taken ONLY from ENV STRIPE_PRICE_ID_EUR_50.
     """
     now = _now_utc()
@@ -96,15 +95,11 @@ def handle_post_stripe_checkout_sessions(app, environ) -> dict:
         customer_id = None
 
     if not session_id or not session_url:
-        return error(
-            502,
-            "bad_gateway",
-            "Stripe returned an invalid checkout session",
-            {"request_id": request_id},
-        )
+        return error(502, "bad_gateway", "Stripe returned an invalid checkout session", {"request_id": request_id})
 
     stripe_link_persisted = False
     try:
+        # Best-effort: store link for debugging and possible fallback resolution.
         app.storage.upsert_stripe_link(
             stripe_session_id=session_id,
             stripe_customer_id=customer_id,
@@ -169,6 +164,10 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
     sig = environ.get("HTTP_STRIPE_SIGNATURE")
     if not sig:
         return error(400, "bad_request", "Missing Stripe-Signature header", {"request_id": request_id})
+
+    # Render/WSGI may deliver headers as bytes. _stripe.py expects str and does .split(",")
+    if isinstance(sig, (bytes, bytearray)):
+        sig = sig.decode("utf-8", "replace")
 
     try:
         evt = stripe_verify_signature(secret, raw_body, sig)
@@ -297,7 +296,7 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
             {"request_id": request_id, "event_id": event_id, "decision": "provider_event_store_fail"},
         )
 
-    # Resolve account_id
+    # Resolve account_id (prefer metadata)
     account_id = meta_account_id
     resolved_by = "metadata"
     if not account_id:
@@ -352,7 +351,7 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
             {"request_id": request_id, "event_id": event_id, "decision": "no_account_resolved"},
         )
 
-    # P0 FIX: ensure account exists BEFORE credit_topup (webhook может прийти раньше любых API вызовов с токеном)
+    # P0 fix: account may not exist yet (self-issued token). Create it deterministically.
     try:
         app.storage.ensure_account(account_id)
     except Exception:
@@ -363,10 +362,8 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
                     "request_id": request_id,
                     "decision": "ensure_account_fail",
                     "event_id": event_id,
-                    "session_id": session_id,
                     "account_id": account_id,
-                    "resolved_by": resolved_by,
-                    "traceback": traceback.format_exc(limit=80),
+                    "traceback": traceback.format_exc(limit=60),
                     "db_path": db_path,
                 },
                 ensure_ascii=False,
@@ -392,21 +389,16 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
             credited_units=credited_units,
             ts=now,
         )
-
         res = app.storage.credit_topup(topup)
 
-        inserted = getattr(res, "inserted", None)
-        res_account_id = getattr(res, "account_id", None)
-        res_balance_units = getattr(res, "balance_units", None)
-        res_credited_units = getattr(res, "credited_units", None)
-
-        if inserted is None:
+        ok = bool(getattr(res, "ok", False))
+        if not ok:
             print(
                 json.dumps(
                     {
                         "provider": "stripe",
                         "request_id": request_id,
-                        "decision": "credit_result_invalid",
+                        "decision": "credit_not_ok",
                         "event_id": event_id,
                         "session_id": session_id,
                         "account_id": account_id,
@@ -414,11 +406,12 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
                         "tx_hash": tx_hash,
                         "credited_units": credited_units,
                         "credit_result": {
-                            "type": type(res).__name__ if res is not None else None,
-                            "inserted": inserted,
-                            "account_id": res_account_id,
-                            "credited_units": res_credited_units,
-                            "balance_units": res_balance_units,
+                            "ok": getattr(res, "ok", None),
+                            "decision": getattr(res, "decision", None),
+                            "credited_units": getattr(res, "credited_units", None),
+                            "balance_units": getattr(res, "balance_units", None),
+                            "topup_id": getattr(res, "topup_id", None),
+                            "account_id": getattr(res, "account_id", None),
                         },
                         "db_path": db_path,
                     },
@@ -430,18 +423,16 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
             return error(
                 500,
                 "internal_error",
-                "Credit result invalid",
-                {"request_id": request_id, "event_id": event_id, "tx_hash": tx_hash, "decision": "credit_result_invalid"},
+                "Credit did not succeed",
+                {"request_id": request_id, "event_id": event_id, "tx_hash": tx_hash, "decision": "credit_not_ok"},
             )
-
-        decision = "credited" if inserted else "dedup_already_credited"
 
         print(
             json.dumps(
                 {
                     "provider": "stripe",
                     "request_id": request_id,
-                    "decision": decision,
+                    "decision": "credited",
                     "event_id": event_id,
                     "session_id": session_id,
                     "account_id": account_id,
@@ -449,19 +440,20 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
                     "tx_hash": tx_hash,
                     "credited_units": credited_units,
                     "credit_result": {
-                        "inserted": inserted,
-                        "account_id": res_account_id,
-                        "credited_units": res_credited_units,
-                        "balance_units": res_balance_units,
+                        "ok": getattr(res, "ok", None),
+                        "decision": getattr(res, "decision", None),
+                        "credited_units": getattr(res, "credited_units", None),
+                        "balance_units": getattr(res, "balance_units", None),
+                        "topup_id": getattr(res, "topup_id", None),
+                        "account_id": getattr(res, "account_id", None),
                     },
-                    "db_path": db_path,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             ),
             flush=True,
         )
-        return json_response(200, {"ok": True, "request_id": request_id, "tx_hash": tx_hash, "decision": decision})
+        return json_response(200, {"ok": True, "request_id": request_id, "tx_hash": tx_hash})
 
     except Exception:
         print(
