@@ -1,5 +1,5 @@
 # FeeSink Stripe helpers (no SDK)
-# FEESINK-API-STRIPE v2026.01.16-01
+# FEESINK-API-STRIPE v2026.01.23-01
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 
 def stripe_parse_sig_header(sig_header: str) -> tuple[Optional[int], Optional[str]]:
@@ -30,10 +30,44 @@ def stripe_parse_sig_header(sig_header: str) -> tuple[Optional[int], Optional[st
     return ts, v1
 
 
-def stripe_verify_signature(raw_body: bytes, sig_header: str, secret: str, tolerance_sec: int = 300) -> bool:
-    if not secret or not str(secret).strip():
+def stripe_verify_signature(
+    raw_body: Union[bytes, bytearray, str],
+    sig_header: Union[str, bytes, bytearray],
+    secret: Union[str, bytes, bytearray],
+    tolerance_sec: int = 300,
+) -> bool:
+    """
+    Stripe webhook signature verification (HMAC SHA256), SDK-free.
+
+    IMPORTANT (P0):
+    - raw_body MUST be the exact request bytes
+    - sig_header MUST be the Stripe-Signature header
+    - secret MUST be STRIPE_WEBHOOK_SECRET
+    """
+    if not secret:
         return False
-    t, v1 = stripe_parse_sig_header(sig_header)
+
+    if isinstance(secret, (bytes, bytearray)):
+        secret_s = secret.decode("utf-8", "replace").strip()
+    else:
+        secret_s = str(secret).strip()
+
+    if not secret_s:
+        return False
+
+    if isinstance(sig_header, (bytes, bytearray)):
+        sig_s = sig_header.decode("utf-8", "replace")
+    else:
+        sig_s = str(sig_header)
+
+    if isinstance(raw_body, str):
+        raw_b = raw_body.encode("utf-8")
+    elif isinstance(raw_body, bytearray):
+        raw_b = bytes(raw_body)
+    else:
+        raw_b = raw_body
+
+    t, v1 = stripe_parse_sig_header(sig_s)
     if t is None or not v1:
         return False
 
@@ -41,8 +75,8 @@ def stripe_verify_signature(raw_body: bytes, sig_header: str, secret: str, toler
     if abs(now - int(t)) > int(tolerance_sec):
         return False
 
-    signed_payload = (str(t) + ".").encode("utf-8") + raw_body
-    expected = hmac.new(str(secret).encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+    signed_payload = (str(t) + ".").encode("utf-8") + raw_b
+    expected = hmac.new(secret_s.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
     try:
         return hmac.compare_digest(expected, v1)
     except Exception:

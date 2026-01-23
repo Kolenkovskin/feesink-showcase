@@ -1,5 +1,5 @@
 # file: feesink/api/handlers_stripe.py
-# FEESINK-API-HANDLERS-STRIPE v2026.01.23-01
+# FEESINK-API-HANDLERS-STRIPE v2026.01.23-02
 
 from __future__ import annotations
 
@@ -165,12 +165,16 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
     if not sig:
         return error(400, "bad_request", "Missing Stripe-Signature header", {"request_id": request_id})
 
-    # Render/WSGI may deliver headers as bytes. _stripe.py expects str and does .split(",")
+    # WSGI may deliver headers as bytes.
     if isinstance(sig, (bytes, bytearray)):
         sig = sig.decode("utf-8", "replace")
 
+    # P0: signature MUST be verified before trusting payload.
     try:
-        evt = stripe_verify_signature(secret, raw_body, sig)
+        ok = stripe_verify_signature(raw_body=raw_body, sig_header=sig, secret=secret)
+        if not ok:
+            raise ValueError("signature_mismatch")
+        evt = json.loads(raw_body.decode("utf-8"))
     except Exception:
         print(
             json.dumps(
@@ -181,6 +185,8 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
                     "traceback": traceback.format_exc(limit=40),
                     "db_path": db_path,
                     "stripe_mode": stripe_mode,
+                    "sig_header_type": type(sig).__name__,
+                    "raw_body_type": type(raw_body).__name__,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
