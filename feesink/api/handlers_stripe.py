@@ -1,5 +1,5 @@
 # file: feesink/api/handlers_stripe.py
-# FEESINK-API-HANDLERS-STRIPE v2026.01.23-02
+# FEESINK-API-HANDLERS-STRIPE v2026.01.23-03
 
 from __future__ import annotations
 
@@ -99,7 +99,6 @@ def handle_post_stripe_checkout_sessions(app, environ) -> dict:
 
     stripe_link_persisted = False
     try:
-        # Best-effort: store link for debugging and possible fallback resolution.
         app.storage.upsert_stripe_link(
             stripe_session_id=session_id,
             stripe_customer_id=customer_id,
@@ -125,7 +124,6 @@ def handle_post_stripe_checkout_sessions(app, environ) -> dict:
             ),
             flush=True,
         )
-        # Still return URL so user can pay; webhook can credit using metadata.
 
     return json_response(
         200,
@@ -141,10 +139,10 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
     """
     POST /v1/webhooks/stripe
 
-    Handles Stripe webhooks:
-    - checkout.session.completed (paid)
-
-    P0: any credit-chain failure => HTTP 500 (Stripe retries).
+    P0 rules:
+    - signature must be verified before trusting payload
+    - paid session must credit exactly once (idempotent by tx_hash)
+    - duplicates must return 200 OK (Stripe retries must not cause 500 loops)
     """
     now = _now_utc()
     request_id = _new_request_id(now)
@@ -165,15 +163,30 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
     if not sig:
         return error(400, "bad_request", "Missing Stripe-Signature header", {"request_id": request_id})
 
-    # WSGI may deliver headers as bytes.
     if isinstance(sig, (bytes, bytearray)):
         sig = sig.decode("utf-8", "replace")
 
-    # P0: signature MUST be verified before trusting payload.
     try:
         ok = stripe_verify_signature(raw_body=raw_body, sig_header=sig, secret=secret)
         if not ok:
             raise ValueError("signature_mismatch")
+
+        # P0: explicit log to separate "signature ok" from "payload parse ok"
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "signature_verified",
+                    "db_path": db_path,
+                    "stripe_mode": stripe_mode,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
         evt = json.loads(raw_body.decode("utf-8"))
     except Exception:
         print(
@@ -215,16 +228,16 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
     print(
         json.dumps(
             {
-                "provider": "stripe",
-                "request_id": request_id,
+                "db_path": db_path,
                 "decision": "webhook_received",
                 "event_id": event_id,
                 "event_type": event_type,
-                "session_id": session_id,
-                "payment_status": payment_status,
                 "meta_account_id": meta_account_id,
                 "meta_price_id": meta_price_id,
-                "db_path": db_path,
+                "payment_status": payment_status,
+                "provider": "stripe",
+                "request_id": request_id,
+                "session_id": session_id,
                 "stripe_mode": stripe_mode,
             },
             ensure_ascii=False,
@@ -357,7 +370,7 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
             {"request_id": request_id, "event_id": event_id, "decision": "no_account_resolved"},
         )
 
-    # P0 fix: account may not exist yet (self-issued token). Create it deterministically.
+    # P0: account may not exist yet (self-issued token). Create it deterministically.
     try:
         app.storage.ensure_account(account_id)
     except Exception:
@@ -395,71 +408,51 @@ def handle_post_webhooks_stripe(app, environ) -> dict:
             credited_units=credited_units,
             ts=now,
         )
-        res = app.storage.credit_topup(topup)
 
-        ok = bool(getattr(res, "ok", False))
-        if not ok:
-            print(
-                json.dumps(
-                    {
-                        "provider": "stripe",
-                        "request_id": request_id,
-                        "decision": "credit_not_ok",
-                        "event_id": event_id,
-                        "session_id": session_id,
-                        "account_id": account_id,
-                        "resolved_by": resolved_by,
-                        "tx_hash": tx_hash,
-                        "credited_units": credited_units,
-                        "credit_result": {
-                            "ok": getattr(res, "ok", None),
-                            "decision": getattr(res, "decision", None),
-                            "credited_units": getattr(res, "credited_units", None),
-                            "balance_units": getattr(res, "balance_units", None),
-                            "topup_id": getattr(res, "topup_id", None),
-                            "account_id": getattr(res, "account_id", None),
-                        },
-                        "db_path": db_path,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-            return error(
-                500,
-                "internal_error",
-                "Credit did not succeed",
-                {"request_id": request_id, "event_id": event_id, "tx_hash": tx_hash, "decision": "credit_not_ok"},
-            )
+        # Contract: returns CreditResult(inserted: bool, topup: TopUp)
+        res = app.storage.credit_topup(topup)
+        inserted = bool(getattr(res, "inserted", False))
+
+        # Read balance for audit/logging
+        try:
+            acct = app.storage.get_account(account_id)
+            balance_units = int(getattr(acct, "balance_units"))
+        except Exception:
+            balance_units = None
 
         print(
             json.dumps(
                 {
                     "provider": "stripe",
                     "request_id": request_id,
-                    "decision": "credited",
+                    "decision": "credited" if inserted else "duplicate_tx_hash",
                     "event_id": event_id,
                     "session_id": session_id,
                     "account_id": account_id,
                     "resolved_by": resolved_by,
                     "tx_hash": tx_hash,
                     "credited_units": credited_units,
-                    "credit_result": {
-                        "ok": getattr(res, "ok", None),
-                        "decision": getattr(res, "decision", None),
-                        "credited_units": getattr(res, "credited_units", None),
-                        "balance_units": getattr(res, "balance_units", None),
-                        "topup_id": getattr(res, "topup_id", None),
-                        "account_id": getattr(res, "account_id", None),
-                    },
+                    "inserted": inserted,
+                    "balance_units": balance_units,
+                    "db_path": db_path,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             ),
             flush=True,
         )
-        return json_response(200, {"ok": True, "request_id": request_id, "tx_hash": tx_hash})
+
+        # P0: both cases are success for Stripe (avoid retry loops)
+        return json_response(
+            200,
+            {
+                "ok": True,
+                "request_id": request_id,
+                "tx_hash": tx_hash,
+                "inserted": inserted,
+                "balance_units": balance_units,
+            },
+        )
 
     except Exception:
         print(
