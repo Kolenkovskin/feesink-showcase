@@ -1,5 +1,5 @@
 # file: feesink/api/handlers_stripe.py
-# FEESINK-API-HANDLERS-STRIPE v2026.01.22-02
+# FEESINK-API-HANDLERS-STRIPE v2026.01.22-03
 
 from __future__ import annotations
 
@@ -20,17 +20,10 @@ def _now_utc() -> datetime:
 
 
 def _new_request_id(now: datetime) -> str:
-    # stdlib-only, sufficiently unique per process + timestamp
     return f"req_{utc_iso(now)}_pid{os.getpid()}"
 
 
 def _require_self_issued_token(environ) -> str:
-    """
-    Self-issued token canon:
-    - user creates token themselves
-    - token identifies account_id
-    - token is used as Bearer token for API calls
-    """
     token = (get_bearer_token(environ) or "").strip()
     if not token:
         raise ValueError("missing bearer token")
@@ -38,37 +31,19 @@ def _require_self_issued_token(environ) -> str:
 
 
 def _token_to_account_id(token: str) -> str:
-    # Canon: token == account_id (self-issued)
     return token.strip()
 
 
-def _get_db_path(app) -> str | None:
-    return getattr(getattr(getattr(app.storage, "_schema", None), "_config", None), "db_path", None)
-
-
-def _normalize_stripe_post_result(ret):
-    """
-    Accept both shapes:
-      - obj
-      - (obj, err)
-    """
-    if isinstance(ret, tuple) and len(ret) == 2:
-        return ret[0], ret[1]
-    return ret, None
-
-
-def handle_post_stripe_checkout_sessions(environ, app) -> dict:
+def handle_post_stripe_checkout_sessions(app, environ):
     """
     POST /v1/stripe/checkout_sessions
 
-    Creates a Stripe Checkout Session for a self-issued token (token == account_id)
-    and persists stripe_links mapping (stripe_session_id -> account_id).
+    Creates a Stripe Checkout Session for a self-issued token (token == account_id).
 
     Price is taken ONLY from ENV STRIPE_PRICE_ID_EUR_50.
     """
     now = _now_utc()
     request_id = _new_request_id(now)
-    db_path = _get_db_path(app)
 
     try:
         token = _require_self_issued_token(environ)
@@ -76,8 +51,6 @@ def handle_post_stripe_checkout_sessions(environ, app) -> dict:
         return error(401, "unauthorized", "Missing Bearer token", {"request_id": request_id})
 
     account_id = _token_to_account_id(token)
-
-    # P0 guard: checkout_session without account_id forbidden
     if not account_id:
         return error(400, "bad_request", "Empty account_id", {"request_id": request_id})
 
@@ -107,46 +80,16 @@ def handle_post_stripe_checkout_sessions(environ, app) -> dict:
     }
 
     try:
-        ret = stripe_api_post_form(secret_key, "/v1/checkout/sessions", form)
-        obj, err = _normalize_stripe_post_result(ret)
+        obj, err = stripe_api_post_form(secret_key, "/v1/checkout/sessions", form)
     except Exception as ex:
-        print(
-            json.dumps(
-                {
-                    "provider": "stripe",
-                    "request_id": request_id,
-                    "decision": "stripe_api_call_fail",
-                    "exc": type(ex).__name__,
-                    "traceback": traceback.format_exc(limit=60),
-                    "db_path": db_path,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-            flush=True,
-        )
         return error(502, "bad_gateway", "Stripe API call failed", {"request_id": request_id, "exc": str(ex)})
 
     if err or not isinstance(obj, dict):
-        print(
-            json.dumps(
-                {
-                    "provider": "stripe",
-                    "request_id": request_id,
-                    "decision": "stripe_api_error",
-                    "err": err,
-                    "obj_type": type(obj).__name__,
-                    "db_path": db_path,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-            flush=True,
-        )
         return error(502, "bad_gateway", "Stripe API call failed", {"request_id": request_id, "err": err})
 
     session_id = (obj.get("id") or "").strip()
     session_url = (obj.get("url") or "").strip()
+
     customer_id = obj.get("customer")
     if isinstance(customer_id, str):
         customer_id = customer_id.strip()
@@ -161,6 +104,7 @@ def handle_post_stripe_checkout_sessions(environ, app) -> dict:
             {"request_id": request_id},
         )
 
+    # Best-effort store stripe link (do not block payment URL)
     stripe_link_persisted = False
     try:
         app.storage.upsert_stripe_link(
@@ -181,14 +125,13 @@ def handle_post_stripe_checkout_sessions(environ, app) -> dict:
                     "account_id": account_id,
                     "exc": type(ex).__name__,
                     "traceback": traceback.format_exc(limit=60),
-                    "db_path": db_path,
+                    "db_path": getattr(getattr(getattr(app.storage, "_schema", None), "_config", None), "db_path", None),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             ),
             flush=True,
         )
-        # still return url so user can pay; credit relies on webhook metadata/stripe_links.
 
     return json_response(
         200,
@@ -200,17 +143,19 @@ def handle_post_stripe_checkout_sessions(environ, app) -> dict:
     )
 
 
-def handle_post_webhooks_stripe(environ, app) -> dict:
+def handle_post_webhooks_stripe(app, environ):
     """
     POST /v1/webhooks/stripe
 
-    P0 rules:
-    - paid must lead to exactly-once credit
-    - any failure in chain -> HTTP 500 so Stripe retries
+    Handles Stripe webhooks:
+    - checkout.session.completed (paid)
+
+    P0: any credit-chain failure => HTTP 500 (Stripe retries).
     """
     now = _now_utc()
     request_id = _new_request_id(now)
-    db_path = _get_db_path(app)
+
+    db_path = getattr(getattr(getattr(app.storage, "_schema", None), "_config", None), "db_path", None)
     stripe_mode = (os.getenv("FEESINK_STRIPE_MODE") or "").strip() or None
 
     secret = (os.getenv("STRIPE_WEBHOOK_SECRET") or "").strip()
@@ -228,24 +173,8 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
 
     try:
         ok = stripe_verify_signature(raw_body, sig, secret)
-    except Exception as ex:
-        print(
-            json.dumps(
-                {
-                    "provider": "stripe",
-                    "request_id": request_id,
-                    "decision": "signature_verify_crash",
-                    "exc": type(ex).__name__,
-                    "traceback": traceback.format_exc(limit=60),
-                    "db_path": db_path,
-                    "stripe_mode": stripe_mode,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-        return error(400, "bad_request", "Invalid signature", {"request_id": request_id})
+    except Exception:
+        ok = False
 
     if not ok:
         print(
@@ -254,6 +183,7 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
                     "provider": "stripe",
                     "request_id": request_id,
                     "decision": "signature_verify_fail",
+                    "traceback": traceback.format_exc(limit=40),
                     "db_path": db_path,
                     "stripe_mode": stripe_mode,
                 },
@@ -265,9 +195,9 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
         return error(400, "bad_request", "Invalid signature", {"request_id": request_id})
 
     try:
-        evt = json.loads(raw_body.decode("utf-8", errors="replace"))
+        evt = json.loads(raw_body.decode("utf-8"))
     except Exception:
-        return error(400, "bad_request", "Invalid JSON body", {"request_id": request_id})
+        return error(400, "bad_request", "Invalid JSON", {"request_id": request_id})
 
     if not isinstance(evt, dict):
         return error(400, "bad_request", "Invalid event payload", {"request_id": request_id})
@@ -275,14 +205,10 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
     event_id = (evt.get("id") or "").strip()
     event_type = (evt.get("type") or "").strip()
 
-    data_obj = {}
-    if isinstance(evt.get("data"), dict):
-        obj = (evt.get("data") or {}).get("object")
-        if isinstance(obj, dict):
-            data_obj = obj
-
+    data_obj = (((evt.get("data") or {}).get("object") or {}) if isinstance(evt.get("data"), dict) else {})
     session_id = (data_obj.get("id") or "").strip()
     payment_status = (data_obj.get("payment_status") or "").strip()
+
     metadata = data_obj.get("metadata") or {}
     meta_account_id = None
     meta_price_id = None
@@ -312,22 +238,51 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
     )
 
     if event_type != "checkout.session.completed":
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "ignored_event",
+                    "event_id": event_id,
+                    "event_type": event_type,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         return json_response(200, {"ok": True})
 
     if not session_id:
         return error(500, "internal_error", "Missing session_id in checkout.session.completed", {"request_id": request_id})
 
     if payment_status != "paid":
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "not_paid",
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "payment_status": payment_status,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         return json_response(200, {"ok": True})
 
-    # Provider event store MUST succeed
+    # provider_event store (best-effort; do not block credit)
     try:
         app.storage.insert_provider_event(
             provider="stripe",
             provider_event_id=event_id,
             raw_json=json.dumps(evt, ensure_ascii=False),
         )
-    except Exception as ex:
+    except Exception:
         print(
             json.dumps(
                 {
@@ -335,8 +290,7 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
                     "request_id": request_id,
                     "decision": "provider_event_store_fail",
                     "event_id": event_id,
-                    "exc": type(ex).__name__,
-                    "traceback": traceback.format_exc(limit=80),
+                    "traceback": traceback.format_exc(limit=60),
                     "db_path": db_path,
                     "stripe_mode": stripe_mode,
                 },
@@ -344,12 +298,6 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
                 sort_keys=True,
             ),
             flush=True,
-        )
-        return error(
-            500,
-            "internal_error",
-            "Failed to store provider event",
-            {"request_id": request_id, "event_id": event_id, "decision": "provider_event_store_fail"},
         )
 
     # Resolve account_id
@@ -360,7 +308,7 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
             account_id = app.storage.resolve_account_by_stripe_session(session_id)
             if account_id:
                 resolved_by = "stripe_links"
-        except Exception as ex:
+        except Exception:
             print(
                 json.dumps(
                     {
@@ -369,9 +317,7 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
                         "decision": "resolve_account_fail",
                         "event_id": event_id,
                         "session_id": session_id,
-                        "exc": type(ex).__name__,
-                        "traceback": traceback.format_exc(limit=80),
-                        "db_path": db_path,
+                        "traceback": traceback.format_exc(limit=60),
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -386,6 +332,22 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
             )
 
     if not account_id:
+        print(
+            json.dumps(
+                {
+                    "provider": "stripe",
+                    "request_id": request_id,
+                    "decision": "no_account_resolved",
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "meta_account_id": meta_account_id,
+                    "db_path": db_path,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         return error(
             500,
             "internal_error",
@@ -393,7 +355,6 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
             {"request_id": request_id, "event_id": event_id, "decision": "no_account_resolved"},
         )
 
-    # Canon pack mapping: EUR 50 => 5000 units
     credited_units = 5000
     tx_hash = f"stripe:{event_id}"
 
@@ -407,8 +368,8 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
         )
         res = app.storage.credit_topup(topup)
 
-        ok_res = bool(getattr(res, "ok", False))
-        if not ok_res:
+        ok2 = bool(getattr(res, "ok", False))
+        if not ok2:
             print(
                 json.dumps(
                     {
@@ -463,7 +424,6 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
                         "topup_id": getattr(res, "topup_id", None),
                         "account_id": getattr(res, "account_id", None),
                     },
-                    "db_path": db_path,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -472,7 +432,7 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
         )
         return json_response(200, {"ok": True, "request_id": request_id, "tx_hash": tx_hash})
 
-    except Exception as ex:
+    except Exception:
         print(
             json.dumps(
                 {
@@ -485,8 +445,7 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
                     "resolved_by": resolved_by,
                     "tx_hash": tx_hash,
                     "credited_units": credited_units,
-                    "exc": type(ex).__name__,
-                    "traceback": traceback.format_exc(limit=120),
+                    "traceback": traceback.format_exc(limit=80),
                     "db_path": db_path,
                 },
                 ensure_ascii=False,
@@ -502,7 +461,7 @@ def handle_post_webhooks_stripe(environ, app) -> dict:
         )
 
 
-def handle_get_stripe_success(environ, app) -> dict:
+def handle_get_stripe_success(app, environ):
     qs = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
     account_id = (qs.get("account_id", [""])[0] or "").strip()
     request_id = (qs.get("request_id", [""])[0] or "").strip()
@@ -521,5 +480,5 @@ def handle_get_stripe_success(environ, app) -> dict:
     )
 
 
-def handle_get_stripe_cancel(environ, app) -> dict:
+def handle_get_stripe_cancel(app, environ):
     return json_response(200, {"ok": True})
