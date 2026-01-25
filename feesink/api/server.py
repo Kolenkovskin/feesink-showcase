@@ -179,11 +179,11 @@ Invoke-RestMethod `
   -Method Post `
   -Uri "https://api.feesink.com/v1/endpoints" `
   -Headers @{{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }} `
-  -Body '{
+  -Body '{{
     "url": "https://my-site.com/health",
     "interval_seconds": 300,
     "enabled": true
-  }'</code></pre>
+  }}'</code></pre>
             <p>3. Check your balance:</p>
             <pre><code>$token = "your_token_here"
 
