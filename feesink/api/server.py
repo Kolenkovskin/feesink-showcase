@@ -31,11 +31,9 @@ def _sha256_hex_prefix(s: str, n: int = 8) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:n]
 
 def _get_listen_host() -> str:
-    # Render must bind on 0.0.0.0 to expose the service publicly.
     return (os.getenv("FEESINK_API_HOST") or "0.0.0.0").strip()
 
 def _get_listen_port() -> int:
-    # Render provides PORT env var. Use it first.
     port_raw = (os.getenv("PORT") or os.getenv("FEESINK_API_PORT") or "8789").strip()
     try:
         return int(port_raw)
