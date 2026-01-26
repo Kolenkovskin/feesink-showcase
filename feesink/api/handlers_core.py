@@ -1,5 +1,5 @@
 # FeeSink API core handlers (HTTP endpoints + dev topups)
-# FEESINK-API-HANDLERS-CORE v2026.01.26-02
+# FEESINK-API-HANDLERS-CORE v2026.01.26-03
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from feesink.api._http import (
 )
 from feesink.config.canon import MIN_TOPUP_USDT, credited_units
 from feesink.domain.models import Endpoint, PausedReason
-from feesink.storage.interfaces import NotFound, ValidationError
+from feesink.storage.interfaces import Conflict, NotFound, ValidationError
 
 
 def _now_utc() -> datetime:
@@ -110,6 +110,12 @@ def handle_post_endpoints(app, environ):
         return err
     assert account_id is not None
 
+    # Critical: endpoints has FK(account_id)->accounts, so account must exist deterministically.
+    try:
+        app.storage.ensure_account(account_id)
+    except Exception as ex:
+        return error(500, "internal_error", "Failed to ensure account", {"exception": type(ex).__name__})
+
     data, err2 = _read_json_or_400(environ)
     if err2:
         return err2
@@ -145,13 +151,15 @@ def handle_post_endpoints(app, environ):
             paused_reason=None if enabled else PausedReason.MANUAL,
         )
     except ValueError as ex:
-        # domain invariant violation -> deterministic 400
         return error(400, "invalid_request", str(ex))
     except Exception as ex:
         return error(500, "internal_error", "Failed to build endpoint", {"exception": type(ex).__name__})
 
     try:
         created = app.storage.add_endpoint(endpoint)
+    except Conflict as ex:
+        # Deterministic contract: conflict is not a random server error.
+        return error(409, "conflict", "Endpoint conflict", {"reason": str(ex)})
     except TypeError as ex:
         return error(
             500,
@@ -228,6 +236,8 @@ def handle_patch_endpoint(app, environ, endpoint_id: str):
 
     try:
         _ = app.storage.update_endpoint(updated)
+    except Conflict as ex:
+        return error(409, "conflict", "Endpoint conflict", {"reason": str(ex)})
     except TypeError as ex:
         return error(
             500,
@@ -255,6 +265,8 @@ def handle_delete_endpoint(app, environ, endpoint_id: str):
         app.storage.delete_endpoint(account_id=account_id, endpoint_id=endpoint_id)
     except NotFound:
         return error(404, "not_found", "Endpoint not found")
+    except Conflict as ex:
+        return error(409, "conflict", "Endpoint conflict", {"reason": str(ex)})
     except TypeError as ex:
         return error(
             500,
