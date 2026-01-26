@@ -18,8 +18,8 @@ from feesink.api.app import FeeSinkApiApp
 # ----------------------------
 # Version banner (must print at startup)
 # ----------------------------
-API_VERSION = "FEESINK-API-APP v2026.01.25-02"  # Обновлено после добавления блока After Payment
-LANDING_VERSION = "Landing v2026.01.25-02"      # Метка версии HTML-лендинга
+API_VERSION = "FEESINK-API-APP v2026.01.25-02"  # API app version (do not change here unless app.py changes)
+LANDING_VERSION = "Landing v2026.01.26-01"      # Text-only update to match PRODUCT_CANON + EXIT_CRITERIA
 
 def _safe_getattr(mod, name: str, default: str) -> str:
     try:
@@ -133,14 +133,15 @@ def _landing_html(api_version: str) -> bytes:
         li {{ margin: 4px 0; }}
         pre {{ background:#f8f8f8; padding:15px; border-radius:6px; overflow-x:auto; font-size:13px; }}
         .warning {{ color:red; font-weight:bold; }}
+        .warningbox {{ margin-top: 10px; padding: 12px 12px; border: 1px solid #f0b6b6; background: #fff5f5; border-radius: 8px; }}
         .after-payment {{ margin-top:30px; padding:20px; border:1px solid #ddd; background:#f9f9f9; border-radius:8px; }}
     </style>
 </head>
 <body>
     <div class="box">
         <h1>FeeSink</h1>
-        <p class="muted">Prepaid endpoint monitoring API.</p>
-        <p class="small">Invariants: <b>1 check = 1 unit</b> · prepaid only · no subscriptions.</p>
+        <p class="muted">Prepaid HTTP endpoint checks API. Pay once, spend exactly 1 unit per performed check.</p>
+        <p class="small">Invariants: prepaid only · <b>1 check = 1 unit</b> · charging happens after the check · no subscriptions.</p>
 
         <div class="row">
             <div class="small"><b>Step 1 — Generate a token (API key)</b></div>
@@ -150,6 +151,15 @@ def _landing_html(api_version: str) -> bytes:
                 <li>Keep it secret. Anyone with the token can spend your units.</li>
                 <li>If you lose it, funds tied to that token cannot be recovered.</li>
             </ul>
+
+            <div class="warningbox small">
+                <b>⚠️ IMPORTANT</b><br/>
+                Your token is your only access key.<br/>
+                • Anyone with the token can spend its units.<br/>
+                • If you lose the token, funds tied to it cannot be recovered.<br/>
+                • There is no email, no password reset, and no recovery.<br/>
+                Store the token securely (password manager recommended).
+            </div>
         </div>
 
         <div class="row">
@@ -163,33 +173,39 @@ def _landing_html(api_version: str) -> bytes:
 
         <div class="row">
             <div class="small"><b>Step 2 — Pay</b></div>
-            <div class="small muted">Paste your token above, then pay. The payment credits units to that token/account.</div>
+            <div class="small muted">Paste your token above, then pay. The payment credits prepaid units to that token (account).</div>
             <button class="btn" id="payBtn">Pay €50 → Get 5000 units</button>
         </div>
 
         <div class="after-payment">
             <h3>After Payment — What To Do Next</h3>
-            <p>1. Copy your token from above and save it securely (password manager).</p>
-            <p>2. Add your first endpoint to monitor (replace with your URL):</p>
+
+            <p>1. Copy your token and store it securely. This token is your account and cannot be recovered if lost.</p>
+
+            <p>2. Add an endpoint you want to check (replace with your own URL):</p>
             <pre><code>$token = "your_token_here"
 
 Invoke-RestMethod `
   -Method Post `
-  -Uri "https://api.feesink.com/v1/endpoints" `
+  -Uri "https://feesink.com/v1/endpoints" `
   -Headers @{{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }} `
   -Body '{{
-    "url": "https://my-site.com/health",
+    "url": "https://your-service.com/healthz",
     "interval_seconds": 300,
     "enabled": true
   }}'</code></pre>
-            <p>3. Check your balance:</p>
-            <pre><code>$token = "your_token_here"
 
-Invoke-RestMethod `
-  -Uri "https://api.feesink.com/v1/accounts/balance" `
-  -Headers @{{ Authorization = "Bearer $token" }}</code></pre>
-            <p><span class="warning">Important: Token is your only key. No email recovery. Save it now in password manager.</span></p>
-            <p>Done — checks start automatically. For more details see <a href="/CLIENT_QUICK_START.md">Quick Start Guide</a>.</p>
+            <p>3. Checks will run only if:</p>
+            <ul class="small muted">
+                <li>an endpoint is added and enabled</li>
+                <li>your balance has units available</li>
+            </ul>
+
+            <p>4. Each performed check costs exactly <b>1 unit</b>. Charging happens after the check.</p>
+
+            <p class="small muted">For more details see <a href="/CLIENT_QUICK_START.md">Quick Start Guide</a>.</p>
+
+            <p><span class="warning">Important: Your token is your only key. There is no email, no password reset, and no recovery. Save it securely before continuing.</span></p>
         </div>
 
         <div id="msg" class="err" style="display:none;"></div>
