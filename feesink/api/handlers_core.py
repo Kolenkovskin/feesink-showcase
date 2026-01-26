@@ -1,5 +1,5 @@
 # FeeSink API core handlers (HTTP endpoints + dev topups)
-# FEESINK-API-HANDLERS-CORE v2026.01.26-01
+# FEESINK-API-HANDLERS-CORE v2026.01.26-02
 
 from __future__ import annotations
 
@@ -31,35 +31,32 @@ def _auth_account(app, environ) -> Tuple[Optional[str], Optional[Tuple[int, list
 
 
 def _status_to_public(value: object) -> str:
-    """
-    Normalize internal AccountStatus to public API string.
-
-    Internal may be:
-      - enum AccountStatus.ACTIVE
-      - string "active"
-      - other printable representation
-    Public contract:
-      "active" | "paused" | "inactive" | "unknown"
-    """
     if value is None:
         return "unknown"
-    # Enum repr often looks like "AccountStatus.ACTIVE"
     s = str(value).strip()
     if not s:
         return "unknown"
     if "." in s:
         s = s.split(".")[-1]
     s = s.lower()
-
     if s in ("active", "paused", "inactive"):
         return s
     return "unknown"
 
 
-def handle_get_ui_success(app, environ):
-    token = get_query_param(environ, "token") or ""
-    token = token.strip()
+def _read_json_or_400(environ):
+    obj, err_code = read_json(environ)
+    if err_code is None:
+        return obj, None
+    if err_code == "empty_body":
+        return None, error(400, "invalid_request", "Empty body")
+    if err_code == "invalid_json":
+        return None, error(400, "invalid_request", "Invalid JSON")
+    return None, error(400, "invalid_request", "Invalid request body", {"reason": err_code})
 
+
+def handle_get_ui_success(app, environ):
+    token = (get_query_param(environ, "token") or "").strip()
     html = f"""<!doctype html>
 <html>
   <head><meta charset="utf-8"><title>FeeSink</title></head>
@@ -79,19 +76,11 @@ def handle_get_me(app, environ):
     if err:
         return err
     assert account_id is not None
-
-    # Ensure account exists (idempotent)
     app.storage.ensure_account(account_id)
-
     return json_response(200, {"account": {"account_id": account_id}})
 
 
 def handle_get_accounts_balance(app, environ):
-    """
-    GET /v1/accounts/balance
-    Auth: Bearer token
-    Returns: account_id, balance_units, status, units_per_check
-    """
     account_id, err = _auth_account(app, environ)
     if err:
         return err
@@ -121,7 +110,7 @@ def handle_post_endpoints(app, environ):
         return err
     assert account_id is not None
 
-    data, err2 = read_json(environ)
+    data, err2 = _read_json_or_400(environ)
     if err2:
         return err2
 
@@ -145,15 +134,21 @@ def handle_post_endpoints(app, environ):
 
     interval_minutes = interval_seconds // 60
 
-    endpoint = Endpoint(
-        endpoint_id=uuid4().hex,
-        account_id=account_id,
-        url=url,
-        interval_minutes=interval_minutes,
-        enabled=enabled,
-        next_check_at=_now_utc(),
-        paused_reason=None if enabled else PausedReason.MANUAL,
-    )
+    try:
+        endpoint = Endpoint(
+            endpoint_id=uuid4().hex,
+            account_id=account_id,
+            url=url,
+            interval_minutes=interval_minutes,
+            enabled=enabled,
+            next_check_at=_now_utc(),
+            paused_reason=None if enabled else PausedReason.MANUAL,
+        )
+    except ValueError as ex:
+        # domain invariant violation -> deterministic 400
+        return error(400, "invalid_request", str(ex))
+    except Exception as ex:
+        return error(500, "internal_error", "Failed to build endpoint", {"exception": type(ex).__name__})
 
     try:
         created = app.storage.add_endpoint(endpoint)
@@ -188,7 +183,7 @@ def handle_patch_endpoint(app, environ, endpoint_id: str):
         return err
     assert account_id is not None
 
-    data, err2 = read_json(environ)
+    data, err2 = _read_json_or_400(environ)
     if err2:
         return err2
 
@@ -220,23 +215,16 @@ def handle_patch_endpoint(app, environ, endpoint_id: str):
     except Exception as ex:
         return error(500, "internal_error", "Failed to load endpoint", {"exception": type(ex).__name__})
 
-    # Hide existence if endpoint belongs to another account
     if str(current.account_id) != str(account_id):
         return error(404, "not_found", "Endpoint not found")
 
     updated = current
     if url is not None:
         updated = replace(updated, url=url)
-
     if interval_seconds is not None:
         updated = replace(updated, interval_minutes=int(interval_seconds) // 60)
-
     if enabled is not None:
-        updated = replace(
-            updated,
-            enabled=bool(enabled),
-            paused_reason=None if enabled else PausedReason.MANUAL,
-        )
+        updated = replace(updated, enabled=bool(enabled), paused_reason=None if enabled else PausedReason.MANUAL)
 
     try:
         _ = app.storage.update_endpoint(updated)
@@ -281,12 +269,10 @@ def handle_delete_endpoint(app, environ, endpoint_id: str):
 
 
 def handle_post_alerts_test(app, environ):
-    # MVP stub: accept call and return ok (no external integrations here)
     return json_response(200, {"ok": True})
 
 
 def handle_post_topups_dev(app, environ):
-    # DEV only: allows manual topup via API (kept because project is prepaid-only)
     if (app.topup_mode or "").strip().lower() not in ("dev", "development"):
         return error(403, "forbidden", "Dev topups are disabled")
 
@@ -295,7 +281,7 @@ def handle_post_topups_dev(app, environ):
         return err
     assert account_id is not None
 
-    data, err2 = read_json(environ)
+    data, err2 = _read_json_or_400(environ)
     if err2:
         return err2
 
@@ -312,12 +298,9 @@ def handle_post_topups_dev(app, environ):
         return error(400, "invalid_request", f"amount_usdt must be >= {MIN_TOPUP_USDT}")
 
     units = int(credited_units(amount_usdt))
-
-    # DEV tx hash: time-based but deterministic enough for dev; in live we use provider tx hash
     tx_hash = f"dev:{account_id}:{_now_utc().isoformat()}"
 
     try:
-        # Ensure account exists, then credit
         app.storage.ensure_account(account_id)
         res = app.storage.credit_topup(
             topup=app.make_topup(account_id=account_id, tx_hash=tx_hash, amount_usdt=amount_usdt, credited_units=units)
