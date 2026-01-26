@@ -254,3 +254,51 @@ class TopUp:
             raise ValueError("credited_units must be > 0")
 
         _ = ensure_utc(self.ts)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderEvent:
+    """
+    Provider webhook/event row (audit + idempotency).
+
+    Notes:
+    - received_at/signature_verified_at are UTC datetimes
+    - raw_body_sha256 is SHA256 hex of raw bytes (not JSON)
+    """
+    provider: str
+    provider_event_id: str
+
+    event_type: Optional[str]
+    status: str  # 'received' | 'processed' | 'failed' (schema constraint)
+
+    received_at: datetime  # UTC
+    processed_at: Optional[datetime] = None  # UTC
+
+    account_id: Optional[AccountId] = None
+    credited_units: Optional[int] = None
+
+    raw_event_json: Optional[str] = None
+
+    # P1 audit fields
+    raw_body_sha256: Optional[str] = None
+    signature_verified_at: Optional[datetime] = None  # UTC
+
+    def validate(self) -> None:
+        if not self.provider or not str(self.provider).strip():
+            raise ValueError("provider must be non-empty")
+        if not self.provider_event_id or not str(self.provider_event_id).strip():
+            raise ValueError("provider_event_id must be non-empty")
+        if not self.status or not str(self.status).strip():
+            raise ValueError("status must be non-empty")
+
+        _ = ensure_utc(self.received_at)
+        if self.processed_at is not None:
+            _ = ensure_utc(self.processed_at)
+        if self.signature_verified_at is not None:
+            _ = ensure_utc(self.signature_verified_at)
+
+        if self.credited_units is not None:
+            if not isinstance(self.credited_units, int):
+                raise TypeError("credited_units must be int")
+            if self.credited_units < 0:
+                raise ValueError("credited_units must be >= 0")

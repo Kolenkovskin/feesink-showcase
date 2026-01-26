@@ -1,11 +1,13 @@
 # FeeSink API core handlers (HTTP endpoints + dev topups)
-# FEESINK-API-HANDLERS-CORE v2026.01.19-02
+# FEESINK-API-HANDLERS-CORE v2026.01.26-01
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional, Tuple
+from uuid import uuid4
 
 from feesink.api._http import (
     UTC,
@@ -15,6 +17,8 @@ from feesink.api._http import (
     read_json,
 )
 from feesink.config.canon import MIN_TOPUP_USDT, credited_units
+from feesink.domain.models import Endpoint, PausedReason
+from feesink.storage.interfaces import NotFound, ValidationError
 
 
 def _now_utc() -> datetime:
@@ -125,13 +129,57 @@ def handle_post_endpoints(app, environ):
     if not url:
         return error(400, "invalid_request", "Missing 'url'")
 
-    # Minimal MVP fields: url only
+    enabled = data.get("enabled", True)
+    enabled = bool(enabled) if isinstance(enabled, bool) else str(enabled).strip().lower() not in ("0", "false", "no", "off")
+
+    interval_seconds = data.get("interval_seconds", 300)
     try:
-        endpoint_id = app.storage.add_endpoint(account_id=account_id, url=url)
+        interval_seconds = int(interval_seconds)
+    except Exception:
+        return error(400, "invalid_request", "interval_seconds must be int")
+
+    if interval_seconds <= 0:
+        return error(400, "invalid_request", "interval_seconds must be > 0")
+    if interval_seconds % 60 != 0:
+        return error(400, "invalid_request", "interval_seconds must be divisible by 60")
+
+    interval_minutes = interval_seconds // 60
+
+    endpoint = Endpoint(
+        endpoint_id=uuid4().hex,
+        account_id=account_id,
+        url=url,
+        interval_minutes=interval_minutes,
+        enabled=enabled,
+        next_check_at=_now_utc(),
+        paused_reason=None if enabled else PausedReason.MANUAL,
+    )
+
+    try:
+        created = app.storage.add_endpoint(endpoint)
+    except TypeError as ex:
+        return error(
+            500,
+            "storage_contract_violation",
+            "Storage contract mismatch for add_endpoint",
+            {"exception": type(ex).__name__, "op": "add_endpoint"},
+        )
+    except ValidationError as ex:
+        return error(400, "invalid_request", str(ex))
     except Exception as ex:
         return error(500, "internal_error", "Failed to add endpoint", {"exception": type(ex).__name__})
 
-    return json_response(201, {"endpoint": {"endpoint_id": endpoint_id, "url": url}})
+    return json_response(
+        201,
+        {
+            "endpoint": {
+                "endpoint_id": created.endpoint_id,
+                "url": created.url,
+                "interval_seconds": int(created.interval_minutes) * 60,
+                "enabled": bool(created.enabled),
+            }
+        },
+    )
 
 
 def handle_patch_endpoint(app, environ, endpoint_id: str):
@@ -147,14 +195,64 @@ def handle_patch_endpoint(app, environ, endpoint_id: str):
     url = data.get("url")
     if url is not None:
         url = str(url).strip()
+        if not url:
+            return error(400, "invalid_request", "url must be non-empty")
+
+    enabled = data.get("enabled")
+    if enabled is not None:
+        enabled = bool(enabled) if isinstance(enabled, bool) else str(enabled).strip().lower() not in ("0", "false", "no", "off")
+
+    interval_seconds = data.get("interval_seconds")
+    if interval_seconds is not None:
+        try:
+            interval_seconds = int(interval_seconds)
+        except Exception:
+            return error(400, "invalid_request", "interval_seconds must be int")
+        if interval_seconds <= 0:
+            return error(400, "invalid_request", "interval_seconds must be > 0")
+        if interval_seconds % 60 != 0:
+            return error(400, "invalid_request", "interval_seconds must be divisible by 60")
 
     try:
-        ok = app.storage.update_endpoint(account_id=account_id, endpoint_id=endpoint_id, url=url)
+        current = app.storage.get_endpoint(endpoint_id)
+    except NotFound:
+        return error(404, "not_found", "Endpoint not found")
+    except Exception as ex:
+        return error(500, "internal_error", "Failed to load endpoint", {"exception": type(ex).__name__})
+
+    # Hide existence if endpoint belongs to another account
+    if str(current.account_id) != str(account_id):
+        return error(404, "not_found", "Endpoint not found")
+
+    updated = current
+    if url is not None:
+        updated = replace(updated, url=url)
+
+    if interval_seconds is not None:
+        updated = replace(updated, interval_minutes=int(interval_seconds) // 60)
+
+    if enabled is not None:
+        updated = replace(
+            updated,
+            enabled=bool(enabled),
+            paused_reason=None if enabled else PausedReason.MANUAL,
+        )
+
+    try:
+        _ = app.storage.update_endpoint(updated)
+    except TypeError as ex:
+        return error(
+            500,
+            "storage_contract_violation",
+            "Storage contract mismatch for update_endpoint",
+            {"exception": type(ex).__name__, "op": "update_endpoint"},
+        )
+    except ValidationError as ex:
+        return error(400, "invalid_request", str(ex))
+    except NotFound:
+        return error(404, "not_found", "Endpoint not found")
     except Exception as ex:
         return error(500, "internal_error", "Failed to update endpoint", {"exception": type(ex).__name__})
-
-    if not ok:
-        return error(404, "not_found", "Endpoint not found")
 
     return json_response(200, {"ok": True})
 
@@ -166,12 +264,18 @@ def handle_delete_endpoint(app, environ, endpoint_id: str):
     assert account_id is not None
 
     try:
-        ok = app.storage.delete_endpoint(account_id=account_id, endpoint_id=endpoint_id)
+        app.storage.delete_endpoint(account_id=account_id, endpoint_id=endpoint_id)
+    except NotFound:
+        return error(404, "not_found", "Endpoint not found")
+    except TypeError as ex:
+        return error(
+            500,
+            "storage_contract_violation",
+            "Storage contract mismatch for delete_endpoint",
+            {"exception": type(ex).__name__, "op": "delete_endpoint"},
+        )
     except Exception as ex:
         return error(500, "internal_error", "Failed to delete endpoint", {"exception": type(ex).__name__})
-
-    if not ok:
-        return error(404, "not_found", "Endpoint not found")
 
     return json_response(200, {"ok": True})
 
@@ -183,8 +287,8 @@ def handle_post_alerts_test(app, environ):
 
 def handle_post_topups_dev(app, environ):
     # DEV only: allows manual topup via API (kept because project is prepaid-only)
-    if (app.topup_mode or "dev").lower() != "dev":
-        return error(403, "forbidden", "Topups are disabled in this mode")
+    if (app.topup_mode or "").strip().lower() not in ("dev", "development"):
+        return error(403, "forbidden", "Dev topups are disabled")
 
     account_id, err = _auth_account(app, environ)
     if err:
@@ -195,40 +299,29 @@ def handle_post_topups_dev(app, environ):
     if err2:
         return err2
 
-    amount_raw = data.get("amount_usdt")
-    if amount_raw is None:
+    amount_usdt_raw = data.get("amount_usdt")
+    if amount_usdt_raw is None:
         return error(400, "invalid_request", "Missing 'amount_usdt'")
 
     try:
-        amount = Decimal(str(amount_raw)).quantize(Decimal("1"))
+        amount_usdt = Decimal(str(amount_usdt_raw))
     except Exception:
-        return error(400, "invalid_request", "Invalid 'amount_usdt'")
+        return error(400, "invalid_request", "'amount_usdt' must be numeric")
 
-    if amount < MIN_TOPUP_USDT:
-        return error(400, "invalid_request", "Topup amount below minimum", {"min_usdt": str(MIN_TOPUP_USDT)})
+    if amount_usdt < MIN_TOPUP_USDT:
+        return error(400, "invalid_request", f"amount_usdt must be >= {MIN_TOPUP_USDT}")
 
-    try:
-        cu = int(credited_units(amount))
-    except Exception as ex:
-        return error(400, "invalid_request", "Unable to convert amount_usdt to units", {"exception": type(ex).__name__})
+    units = int(credited_units(amount_usdt))
 
-    from feesink.domain.models import TopUp  # type: ignore
-
-    tx_hash = f"dev:{account_id}:{int(_now_utc().timestamp())}"
-    topup = TopUp(
-        account_id=account_id,
-        tx_hash=tx_hash,
-        amount_usdt=amount,
-        credited_units=cu,
-        ts=_now_utc(),
-    )
-    try:
-        topup.validate()
-    except Exception as ex:
-        return error(400, "invalid_request", "TopUp validation failed", {"exception": type(ex).__name__})
+    # DEV tx hash: time-based but deterministic enough for dev; in live we use provider tx hash
+    tx_hash = f"dev:{account_id}:{_now_utc().isoformat()}"
 
     try:
-        res = app.storage.credit_topup(topup)
+        # Ensure account exists, then credit
+        app.storage.ensure_account(account_id)
+        res = app.storage.credit_topup(
+            topup=app.make_topup(account_id=account_id, tx_hash=tx_hash, amount_usdt=amount_usdt, credited_units=units)
+        )
     except Exception as ex:
         return error(500, "internal_error", "Failed to credit topup", {"exception": type(ex).__name__})
 
@@ -239,9 +332,9 @@ def handle_post_topups_dev(app, environ):
             "topup": {
                 "account_id": account_id,
                 "tx_hash": tx_hash,
-                "amount_usdt": str(amount),
-                "credited_units": cu,
-                "inserted": bool(getattr(res, "inserted", False)),
+                "amount_usdt": str(amount_usdt),
+                "credited_units": units,
+                "inserted": bool(getattr(res, "inserted", True)),
             },
         },
     )

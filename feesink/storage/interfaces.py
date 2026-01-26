@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional, Protocol, Sequence
+from typing import Optional, Protocol, Sequence
 
 from feesink.domain.models import (
     Account,
@@ -25,6 +25,7 @@ from feesink.domain.models import (
     CheckEvent,
     Endpoint,
     EndpointId,
+    ProviderEvent,
     TopUp,
     TxHash,
 )
@@ -135,6 +136,23 @@ class Storage(Protocol):
         """
         Persist status field if tracked explicitly by storage.
         status is expected to be one of: 'active' | 'depleted'
+        """
+
+    # -------- Provider events (webhook dedup + audit) --------
+
+    def insert_provider_event(self, event: ProviderEvent) -> bool:
+        """
+        Insert provider event row (idempotent).
+
+        Returns:
+        - True if inserted
+        - False if duplicate (dedup)
+
+        MUST:
+        - enforce uniqueness by (provider, provider_event_id)
+        - store audit fields when provided:
+          - raw_body_sha256 (hex)
+          - signature_verified_at_utc (UTC)
         """
 
     # -------- Endpoints --------
