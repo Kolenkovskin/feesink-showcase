@@ -1,5 +1,5 @@
-# FeeSink API core handlers (HTTP endpoints + dev topups)
-# FEESINK-API-HANDLERS-CORE v2026.01.26-03
+# FeeSink API core handlers
+# FEESINK-API-HANDLERS-CORE v2026.01.26-04
 
 from __future__ import annotations
 
@@ -9,15 +9,21 @@ from decimal import Decimal
 from typing import Optional, Tuple
 from uuid import uuid4
 
+import socket
+import time
+import urllib.request
+import urllib.error
+
 from feesink.api._http import (
     UTC,
     error,
     get_query_param,
     json_response,
     read_json,
+    utc_iso,
 )
 from feesink.config.canon import MIN_TOPUP_USDT, credited_units
-from feesink.domain.models import Endpoint, PausedReason
+from feesink.domain.models import CheckEvent, CheckResult, ErrorClass, Endpoint, PausedReason
 from feesink.storage.interfaces import Conflict, NotFound, ValidationError
 
 
@@ -39,7 +45,7 @@ def _status_to_public(value: object) -> str:
     if "." in s:
         s = s.split(".")[-1]
     s = s.lower()
-    if s in ("active", "paused", "inactive"):
+    if s in ("active", "paused", "inactive", "depleted"):
         return s
     return "unknown"
 
@@ -110,7 +116,7 @@ def handle_post_endpoints(app, environ):
         return err
     assert account_id is not None
 
-    # Critical: endpoints has FK(account_id)->accounts, so account must exist deterministically.
+    # endpoints.account_id is FK -> must exist
     try:
         app.storage.ensure_account(account_id)
     except Exception as ex:
@@ -140,33 +146,20 @@ def handle_post_endpoints(app, environ):
 
     interval_minutes = interval_seconds // 60
 
-    try:
-        endpoint = Endpoint(
-            endpoint_id=uuid4().hex,
-            account_id=account_id,
-            url=url,
-            interval_minutes=interval_minutes,
-            enabled=enabled,
-            next_check_at=_now_utc(),
-            paused_reason=None if enabled else PausedReason.MANUAL,
-        )
-    except ValueError as ex:
-        return error(400, "invalid_request", str(ex))
-    except Exception as ex:
-        return error(500, "internal_error", "Failed to build endpoint", {"exception": type(ex).__name__})
+    endpoint = Endpoint(
+        endpoint_id=uuid4().hex,
+        account_id=account_id,
+        url=url,
+        interval_minutes=interval_minutes,
+        enabled=enabled,
+        next_check_at=_now_utc(),
+        paused_reason=None if enabled else PausedReason.MANUAL,
+    )
 
     try:
         created = app.storage.add_endpoint(endpoint)
     except Conflict as ex:
-        # Deterministic contract: conflict is not a random server error.
         return error(409, "conflict", "Endpoint conflict", {"reason": str(ex)})
-    except TypeError as ex:
-        return error(
-            500,
-            "storage_contract_violation",
-            "Storage contract mismatch for add_endpoint",
-            {"exception": type(ex).__name__, "op": "add_endpoint"},
-        )
     except ValidationError as ex:
         return error(400, "invalid_request", str(ex))
     except Exception as ex:
@@ -180,6 +173,137 @@ def handle_post_endpoints(app, environ):
                 "url": created.url,
                 "interval_seconds": int(created.interval_minutes) * 60,
                 "enabled": bool(created.enabled),
+            }
+        },
+    )
+
+
+def _run_http_check(url: str, timeout_seconds: int) -> tuple[CheckResult, Optional[int], int, Optional[ErrorClass]]:
+    t0 = time.monotonic()
+    http_status: Optional[int] = None
+    err_class: Optional[ErrorClass] = None
+    result = CheckResult.FAIL
+
+    req = urllib.request.Request(
+        url=url,
+        method="GET",
+        headers={"User-Agent": "FeeSink/1.0"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout_seconds)) as resp:
+            http_status = int(getattr(resp, "status", 0) or 0) or None
+            if http_status is not None and 200 <= http_status <= 299:
+                result = CheckResult.OK
+            else:
+                result = CheckResult.FAIL
+                err_class = ErrorClass.HTTP_NON_2XX
+    except urllib.error.HTTPError as e:
+        http_status = int(getattr(e, "code", 0) or 0) or None
+        result = CheckResult.FAIL
+        err_class = ErrorClass.HTTP_NON_2XX
+    except urllib.error.URLError as e:
+        # DNS / connect / TLS often appear here; keep deterministic bucket.
+        result = CheckResult.FAIL
+        err_class = ErrorClass.CONNECT
+    except socket.timeout:
+        result = CheckResult.TIMEOUT
+        err_class = ErrorClass.TIMEOUT
+    except Exception:
+        result = CheckResult.FAIL
+        err_class = ErrorClass.UNKNOWN
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    if latency_ms < 0:
+        latency_ms = 0
+    return result, http_status, latency_ms, err_class
+
+
+def handle_post_checks(app, environ):
+    account_id, err = _auth_account(app, environ)
+    if err:
+        return err
+    assert account_id is not None
+
+    data, err2 = _read_json_or_400(environ)
+    if err2:
+        return err2
+
+    endpoint_id = (data.get("endpoint_id") or "").strip()
+    if not endpoint_id:
+        return error(400, "invalid_request", "Missing 'endpoint_id'")
+
+    timeout_seconds = data.get("timeout_seconds", 10)
+    try:
+        timeout_seconds = int(timeout_seconds)
+    except Exception:
+        return error(400, "invalid_request", "timeout_seconds must be int")
+    if timeout_seconds <= 0 or timeout_seconds > 60:
+        return error(400, "invalid_request", "timeout_seconds must be in [1..60]")
+
+    # Optional dedup_key to allow retry without double-charge
+    dedup_key = (data.get("dedup_key") or "").strip()
+    if not dedup_key:
+        now = _now_utc()
+        dedup_key = f"manual:{endpoint_id}:{utc_iso(now)}:{uuid4().hex}"
+
+    try:
+        ep = app.storage.get_endpoint(endpoint_id)
+    except NotFound:
+        return error(404, "not_found", "Endpoint not found")
+    except Exception as ex:
+        return error(500, "internal_error", "Failed to load endpoint", {"exception": type(ex).__name__})
+
+    if str(ep.account_id) != str(account_id):
+        return error(404, "not_found", "Endpoint not found")
+
+    # FACT: execute the check first
+    result, http_status, latency_ms, err_class = _run_http_check(ep.url, timeout_seconds)
+
+    now = _now_utc()
+    event = CheckEvent(
+        endpoint_id=endpoint_id,
+        ts=now,
+        result=result,
+        latency_ms=latency_ms,
+        http_status=http_status,
+        error_class=err_class,
+        units_charged=1,
+    )
+
+    try:
+        event.validate()
+    except Exception as ex:
+        return error(400, "invalid_request", "CheckEvent validation failed", {"exception": type(ex).__name__})
+
+    # P0: charge strictly after the check fact exists (atomic record + charge in storage)
+    try:
+        ch = app.storage.record_check_and_charge(
+            account_id=account_id,
+            event=event,
+            charge_units=1,
+            dedup_key=dedup_key,
+        )
+    except Conflict as ex:
+        # insufficient balance_units is Conflict in SQLiteChecksMixin
+        return error(409, "insufficient_balance", "Not enough units", {"reason": str(ex)})
+    except ValidationError as ex:
+        return error(400, "invalid_request", str(ex))
+    except Exception as ex:
+        return error(500, "internal_error", "Failed to record check and charge", {"exception": type(ex).__name__})
+
+    return json_response(
+        201,
+        {
+            "check": {
+                "endpoint_id": endpoint_id,
+                "dedup_key": dedup_key,
+                "result": str(result.value),
+                "http_status": http_status,
+                "latency_ms": int(latency_ms),
+                "error_class": (str(err_class.value) if err_class is not None else None),
+                "charged": bool(ch.inserted),
+                "new_balance_units": int(ch.new_balance_units),
             }
         },
     )
@@ -238,13 +362,6 @@ def handle_patch_endpoint(app, environ, endpoint_id: str):
         _ = app.storage.update_endpoint(updated)
     except Conflict as ex:
         return error(409, "conflict", "Endpoint conflict", {"reason": str(ex)})
-    except TypeError as ex:
-        return error(
-            500,
-            "storage_contract_violation",
-            "Storage contract mismatch for update_endpoint",
-            {"exception": type(ex).__name__, "op": "update_endpoint"},
-        )
     except ValidationError as ex:
         return error(400, "invalid_request", str(ex))
     except NotFound:
@@ -267,13 +384,6 @@ def handle_delete_endpoint(app, environ, endpoint_id: str):
         return error(404, "not_found", "Endpoint not found")
     except Conflict as ex:
         return error(409, "conflict", "Endpoint conflict", {"reason": str(ex)})
-    except TypeError as ex:
-        return error(
-            500,
-            "storage_contract_violation",
-            "Storage contract mismatch for delete_endpoint",
-            {"exception": type(ex).__name__, "op": "delete_endpoint"},
-        )
     except Exception as ex:
         return error(500, "internal_error", "Failed to delete endpoint", {"exception": type(ex).__name__})
 

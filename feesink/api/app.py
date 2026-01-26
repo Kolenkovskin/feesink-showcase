@@ -1,6 +1,6 @@
 # file: feesink/api/app.py
 # FeeSink API app (routing + auth)
-# FEESINK-API-APP v2026.01.19-02
+# FEESINK-API-APP v2026.01.26-03
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from feesink.api.handlers_core import (
     handle_get_ui_success,
     handle_patch_endpoint,
     handle_post_alerts_test,
+    handle_post_checks,
     handle_post_endpoints,
     handle_post_topups_dev,
 )
@@ -121,6 +122,9 @@ class FeeSinkApiApp:
 
             elif path == "/v1/endpoints" and method == "POST":
                 status, headers, body = handle_post_endpoints(self, environ)
+
+            elif path == "/v1/checks" and method == "POST":
+                status, headers, body = handle_post_checks(self, environ)
 
             elif path == "/v1/stripe/checkout_sessions" and method == "POST":
                 status, headers, body = handle_post_stripe_checkout_sessions(self, environ)
