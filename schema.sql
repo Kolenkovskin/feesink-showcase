@@ -1,5 +1,5 @@
 -- FeeSink — SQLite Schema (Phase 2)
--- CANON v2026.01.03-STRIPE-01 (aligned with domain/models.py + storage/interfaces.py)
+-- CANON v2026.01.25-LAST-PROVIDER-EVENT-01 (adds accounts.last_provider_event_at_utc, diagnostic only)
 -- NOTE: For every SQLite connection MUST run: PRAGMA foreign_keys = ON;
 
 BEGIN;
@@ -10,25 +10,24 @@ CREATE TABLE IF NOT EXISTS schema_meta (
   value TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('canon_version', 'v2026.01.03-STRIPE-01');
+INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('canon_version', 'v2026.01.25-LAST-PROVIDER-EVENT-01');
 INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('timezone', 'UTC');
 
 -- ---------- accounts ----------
--- Account fields per domain.models.Account:
--- - balance_units: int >= 0
--- - status: 'active' | 'depleted' (runtime may explicitly set)
 CREATE TABLE IF NOT EXISTS accounts (
   account_id     TEXT PRIMARY KEY,
   balance_units  INTEGER NOT NULL CHECK (balance_units >= 0),
   status         TEXT NOT NULL CHECK (status IN ('active','depleted')),
   created_at_utc TEXT NOT NULL,
-  updated_at_utc TEXT NOT NULL
+  updated_at_utc TEXT NOT NULL,
+
+  -- P2 ops-only: last known provider event timestamp for this account (UTC ISO8601)
+  last_provider_event_at_utc TEXT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 
 -- ---------- tokens ----------
--- Persistent token -> account mapping (required for Bearer auth + Stripe provisioning).
 CREATE TABLE IF NOT EXISTS tokens (
   token          TEXT PRIMARY KEY,
   account_id     TEXT NOT NULL,
@@ -40,8 +39,6 @@ CREATE TABLE IF NOT EXISTS tokens (
 CREATE INDEX IF NOT EXISTS idx_tokens_account_id ON tokens(account_id);
 
 -- ---------- provider_events ----------
--- Provider webhook/event dedup table (required for idempotent crediting).
--- Canon: (provider, provider_event_id) can be applied only once.
 CREATE TABLE IF NOT EXISTS provider_events (
   provider          TEXT NOT NULL,
   provider_event_id TEXT NOT NULL,
@@ -53,8 +50,10 @@ CREATE TABLE IF NOT EXISTS provider_events (
   account_id        TEXT NULL,
   credited_units    INTEGER NULL CHECK (credited_units IS NULL OR credited_units >= 0),
 
-  -- Optional debug payload (kept small; implementation may store hash instead).
   raw_event_json    TEXT NULL,
+
+  raw_body_sha256           TEXT NULL,
+  signature_verified_at_utc TEXT NULL,
 
   FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE SET NULL,
 
@@ -63,12 +62,9 @@ CREATE TABLE IF NOT EXISTS provider_events (
 
 CREATE INDEX IF NOT EXISTS idx_provider_events_status ON provider_events(status);
 CREATE INDEX IF NOT EXISTS idx_provider_events_account_id ON provider_events(account_id);
+CREATE INDEX IF NOT EXISTS idx_provider_events_received_at_utc ON provider_events(received_at_utc);
 
 -- ---------- stripe_links ----------
--- Stripe identifiers mapped to accounts (required for provisioning without prior account).
--- Canon:
--- - stripe_session_id is unique
--- - stripe_customer_id (if present) is unique
 CREATE TABLE IF NOT EXISTS stripe_links (
   stripe_session_id  TEXT PRIMARY KEY,
   stripe_customer_id TEXT UNIQUE NULL,
@@ -81,12 +77,6 @@ CREATE TABLE IF NOT EXISTS stripe_links (
 CREATE INDEX IF NOT EXISTS idx_stripe_links_account_id ON stripe_links(account_id);
 
 -- ---------- endpoints ----------
--- Endpoint fields per domain.models.Endpoint:
--- - url: validated absolute URL
--- - interval_minutes: integer (preset)
--- - enabled: bool
--- - next_check_at_utc: UTC scheduling timestamp
--- - last_check_at_utc / last_result are optional telemetry (may be null)
 CREATE TABLE IF NOT EXISTS endpoints (
   endpoint_id       TEXT PRIMARY KEY,
   account_id        TEXT NOT NULL,
@@ -107,7 +97,6 @@ CREATE TABLE IF NOT EXISTS endpoints (
 
   FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE,
 
-  -- enforce: if enabled=1 then paused_reason must be NULL; if enabled=0 then paused_reason must be NOT NULL
   CHECK (
     (enabled = 1 AND paused_reason IS NULL) OR
     (enabled = 0 AND paused_reason IS NOT NULL)
@@ -118,10 +107,6 @@ CREATE INDEX IF NOT EXISTS idx_endpoints_account_id ON endpoints(account_id);
 CREATE INDEX IF NOT EXISTS idx_endpoints_due ON endpoints(enabled, next_check_at_utc);
 
 -- ---------- endpoint_leases ----------
--- Storage leasing contract per storage.interfaces.Lease:
--- - only one active lease per endpoint_id
--- - lease_until is UTC and in future at acquisition
--- - lease_token proves ownership for release
 CREATE TABLE IF NOT EXISTS endpoint_leases (
   endpoint_id      TEXT PRIMARY KEY,
   lease_token      TEXT NOT NULL,
@@ -136,7 +121,6 @@ CREATE TABLE IF NOT EXISTS endpoint_leases (
 CREATE INDEX IF NOT EXISTS idx_endpoint_leases_until ON endpoint_leases(lease_until_utc);
 
 -- ---------- topups ----------
--- TopUp records; idempotent on tx_hash (for crypto/dev-mode).
 CREATE TABLE IF NOT EXISTS topups (
   topup_id       TEXT PRIMARY KEY,
   account_id     TEXT NOT NULL,
@@ -155,27 +139,23 @@ CREATE TABLE IF NOT EXISTS topups (
 CREATE INDEX IF NOT EXISTS idx_topups_account_created ON topups(account_id, created_at_utc);
 
 -- ---------- check_events ----------
--- Check events; storage-limited by retention policy (implementation).
--- Canon:
--- - units_charged is always 1
--- - dedup_key enforces idempotent charging: endpoint_id + scheduled_at_utc
 CREATE TABLE IF NOT EXISTS check_events (
-  check_id        TEXT PRIMARY KEY,
-  account_id      TEXT NOT NULL,
-  endpoint_id     TEXT NOT NULL,
+  check_id         TEXT PRIMARY KEY,
+  account_id       TEXT NOT NULL,
+  endpoint_id      TEXT NOT NULL,
 
   scheduled_at_utc TEXT NOT NULL,
   ts_utc           TEXT NOT NULL,
 
-  result          TEXT NOT NULL CHECK (result IN ('ok','fail')),
-  http_status     INTEGER NULL,
-  latency_ms      INTEGER NULL CHECK (latency_ms IS NULL OR latency_ms >= 0),
-  error_class     TEXT NULL,
+  result           TEXT NOT NULL CHECK (result IN ('ok','fail')),
+  http_status      INTEGER NULL,
+  latency_ms       INTEGER NULL CHECK (latency_ms IS NULL OR latency_ms >= 0),
+  error_class      TEXT NULL,
 
-  dedup_key       TEXT NOT NULL,
+  dedup_key        TEXT NOT NULL,
 
-  units_charged   INTEGER NOT NULL CHECK (units_charged = 1), -- CANON: 1 check = 1 unit
-  created_at_utc  TEXT NOT NULL,
+  units_charged    INTEGER NOT NULL CHECK (units_charged = 1),
+  created_at_utc   TEXT NOT NULL,
 
   FOREIGN KEY (account_id) REFERENCES accounts(account_id) ON DELETE CASCADE,
   FOREIGN KEY (endpoint_id) REFERENCES endpoints(endpoint_id) ON DELETE CASCADE,

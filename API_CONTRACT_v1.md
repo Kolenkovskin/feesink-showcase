@@ -1,66 +1,62 @@
----
-
-### Файл: `docs/API_CONTRACT_v1.md` (или текущий путь в проекте) — полная замена
-
-```markdown
-# FeeSink — API_CONTRACT v1 (canonical)
+# FeeSink — API CONTRACT v1 (canonical)
 
 Version: v2026.01.19-03  
 Status: LIVE / ACTIVE  
-TZ: Europe/Tallinn (timestamps in logs are UTC)
+Timezone: Europe/Tallinn  
+(All timestamps in logs are UTC)
 
-Этот документ — канонический контракт API FeeSink для внешнего пользователя (MVP).
-Описывает только реально поддерживаемое.
-
----
-
-## 0) Глобальные инварианты (P0)
-
-- Prepaid only (нет подписок)
-- 1 check = 1 unit
-- Списание строго после факта проверки
-- Идемпотентность:
-  - provider_events: `provider_event_id` UNIQUE (audit only)
-  - credit: `topups.tx_hash` UNIQUE (единственная граница идемпотентности credit)
+This document defines the **canonical external API contract** of FeeSink (MVP).
+Only behavior described here is considered supported.
 
 ---
 
-## 1) Аутентификация (Bearer token)
+## 0) Global invariants (P0)
 
-Все защищённые эндпоинты требуют:
+These rules are absolute:
 
-```
+- **Prepaid only** (no subscriptions)
+- **1 check = 1 unit**
+- Charging happens **strictly after the check fact**
+- Idempotency:
+  - `provider_events.provider_event_id` — UNIQUE (audit only)
+  - `topups.tx_hash` — UNIQUE (**the only idempotency boundary for crediting**)
+
+---
+
+## 1) Authentication (Bearer token)
+
+All protected endpoints require:
 
 Authorization: Bearer <TOKEN>
 
-```
 
-MVP: токен выдаётся/привязывается сервером в DEV, внешний issuance — следующий этап.
+MVP note:
+- In DEV, the token is issued / bound by the server
+- External token issuance is a later phase
 
 ---
 
 ## 2) GET /v1/accounts/balance ✅ (P1)
 
-### Назначение
-Получить текущий prepaid баланс аккаунта.
+### Purpose
+Retrieve the current prepaid balance of the account.
 
-### Заголовки
-```
-
+### Headers
 Authorization: Bearer <TOKEN>
 
-````
 
-### Поля ответа (канон)
-- `balance_units` — целое число, текущий prepaid баланс в units
-- `units_per_check` — всегда `1` (явный инвариант)
-- `status` — строка, одно из:
+### Response fields (canonical)
+
+- `balance_units` — integer, current prepaid balance in units
+- `units_per_check` — always `1` (explicit invariant)
+- `status` — string, one of:
   - `"active"`
   - `"paused"`
   - `"inactive"`
-  - `"unknown"` (если внутренний статус не распознан)
+  - `"unknown"` (if internal status is not recognized)
 
-### Успешный ответ (200)
+### Success response (200)
+
 ```json
 {
   "account": {
@@ -70,74 +66,47 @@ Authorization: Bearer <TOKEN>
     "units_per_check": 1
   }
 }
-````
+Errors
+401 unauthorized — missing or invalid token
 
-### Ошибки
+500 internal_error — storage or service failure
 
-* 401 `unauthorized` — токен отсутствует/невалидный
-* 500 `internal_error` — внутренняя ошибка storage/сервиса
+3) POST /v1/stripe/checkout_sessions ✅
+Purpose
+Create a Stripe Checkout Session and receive a payment URL.
 
----
-
-## 3) POST /v1/stripe/checkout_sessions ✅
-
-### Назначение
-
-Создать Stripe Checkout Session и получить ссылку для оплаты.
-
-### Заголовки
-
-```
+Headers
 Authorization: Bearer <TOKEN>
 Content-Type: application/json
-```
+Pricing rule (P0)
+The price is selected only from ENV STRIPE_PRICE_ID_EUR_50
 
-### Правило цены (P0)
+The client cannot control pricing or unit amounts
 
-Цена выбирается **только** из ENV `STRIPE_PRICE_ID_EUR_50`.
-Клиент не управляет ценой.
-
-### Успешный ответ (200)
-
-```json
+Success response (200)
 {
   "checkout_session": {
     "id": "cs_live_...",
     "url": "https://checkout.stripe.com/c/pay/..."
   }
 }
-```
+4) POST /v1/webhooks/stripe ✅ (Stripe → FeeSink)
+Supported event
+checkout.session.completed → credit units
 
----
+Other events
+Always respond HTTP 200
 
-## 4) POST /v1/webhooks/stripe ✅ (Stripe → FeeSink)
+Ignored or stored for audit only
 
-Поддерживаемый event:
-
-* `checkout.session.completed` (only credit)
-
-Остальные события:
-
-* HTTP 200 (ignored / audit)
-
----
-
-## 5) Пример PowerShell: Balance
-
-```powershell
+5) PowerShell example: Get balance
 $token = "<TOKEN>"
 
 Invoke-RestMethod `
   -Method Get `
   -Uri "https://feesink.com/v1/accounts/balance" `
   -Headers @{ Authorization = "Bearer $token" }
-```
-
----
-
-## 6) Пример PowerShell: Create Checkout
-
-```powershell
+6) PowerShell example: Create checkout session
 $token = "<TOKEN>"
 
 Invoke-RestMethod `
@@ -146,5 +115,6 @@ Invoke-RestMethod `
   -Headers @{ Authorization = "Bearer $token" } `
   -ContentType "application/json" `
   -Body "{}"
-```
-
+Canonical note
+If real API behavior contradicts this document,
+this document must be updated first — otherwise the behavior is considered a bug.

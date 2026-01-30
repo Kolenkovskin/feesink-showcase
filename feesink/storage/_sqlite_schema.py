@@ -4,7 +4,7 @@ FeeSink SQLite schema/connection layer.
 Split from feesink/storage/sqlite.py without behavior changes.
 
 Version:
-- FEESINK-SQLITE-SCHEMA v2026.01.16-01
+- FEESINK-SQLITE-SCHEMA v2026.01.25-01 (safe accounts.last_provider_event_at_utc migration + layout flag)
 """
 
 from __future__ import annotations
@@ -26,95 +26,160 @@ class SQLiteStorageConfig:
 
 
 class SQLiteSchema:
+    """
+    IMPORTANT:
+    SQLiteStorage facade expects:
+      - self.conn: sqlite3.Connection
+      - self.layout: dict
+      - close(): None
+    """
+
     def __init__(self, config: SQLiteStorageConfig):
         if not isinstance(config.db_path, str) or not config.db_path.strip():
-            raise ValueError("db_path must be non-empty")
-
-        if config.ensure_parent_dir:
-            parent = os.path.dirname(os.path.abspath(config.db_path))
-            if parent and not os.path.isdir(parent):
-                raise ValueError(f"DB parent directory does not exist: {parent}")
-
+            raise ValueError("config.db_path must be a non-empty string")
         self._config = config
-        self._conn = sqlite3.connect(
-            config.db_path,
-            detect_types=sqlite3.PARSE_DECLTYPES,
-            check_same_thread=False,
-        )
-        self._conn.row_factory = sqlite3.Row
 
-        self._apply_pragmas()
-        if config.schema_sql_path:
-            self._ensure_schema(config.schema_sql_path)
-
-        self._layout = self._detect_layout()
-
-    @property
-    def conn(self) -> sqlite3.Connection:
-        return self._conn
-
-    @property
-    def layout(self) -> dict[str, bool]:
-        return self._layout
+        # Facade contract (used by feesink/storage/sqlite.py)
+        self.conn: sqlite3.Connection = self._connect()
+        self.layout: dict = self.detect_layout(self.conn)
 
     def close(self) -> None:
         try:
-            self._conn.close()
+            self.conn.close()
         except Exception:
+            # Best-effort: storage close must not raise in shutdown paths.
             pass
 
-    # ----------------------------
-    # Connection / schema helpers
-    # ----------------------------
+    # ---------------------------------------------------------------------
+    # Internal
+    # ---------------------------------------------------------------------
 
-    def _apply_pragmas(self) -> None:
-        cur = self._conn.cursor()
+    def _connect(self) -> sqlite3.Connection:
+        if self._config.ensure_parent_dir:
+            parent = os.path.dirname(os.path.abspath(self._config.db_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+        conn = sqlite3.connect(self._config.db_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+
+        # Canon: foreign keys ON per connection.
+        conn.execute("PRAGMA foreign_keys = ON;")
+
+        if self._config.enable_wal:
+            conn.execute("PRAGMA journal_mode = WAL;")
+
+        self._apply_schema(conn)
+
+        # Safe migrations (must be safe on existing LIVE DB and on fresh DB)
+        self._migrate_provider_events_audit(conn)
+        self._migrate_accounts_last_provider_event(conn)
+
+        return conn
+
+    def _apply_schema(self, conn: sqlite3.Connection) -> None:
+        schema_sql_path = self._config.schema_sql_path
+        if not schema_sql_path:
+            return
+
         try:
-            cur.execute("PRAGMA foreign_keys = ON;")
-            if self._config.enable_wal:
-                cur.execute("PRAGMA journal_mode = WAL;")
-            cur.execute("PRAGMA synchronous = NORMAL;")
-            cur.execute("PRAGMA busy_timeout = 5000;")
-        finally:
-            cur.close()
+            with open(schema_sql_path, "r", encoding="utf-8") as f:
+                sql = f.read()
+            if not sql.strip():
+                return
+            conn.executescript(sql)
+        except Exception as e:
+            raise StorageError(f"failed to apply schema from {schema_sql_path!r}: {e}") from e
 
-    def _ensure_schema(self, schema_path: str) -> None:
-        if not os.path.isfile(schema_path):
-            raise ValueError(f"schema_sql_path not found: {schema_path}")
-        with open(schema_path, "r", encoding="utf-8") as f:
-            sql = f.read()
-        self._conn.executescript(sql)
-        self._conn.commit()
+    def _migrate_provider_events_audit(self, conn: sqlite3.Connection) -> None:
+        """
+        P1 hardening migration (safe on existing DB, safe on fresh DB):
 
-    def _list_tables(self) -> set[str]:
-        cur = self._conn.cursor()
+        - add provider_events.raw_body_sha256 TEXT (SHA256 hex of raw bytes)
+        - add provider_events.signature_verified_at_utc TEXT (UTC ISO8601)
+        - add index on provider_events(received_at_utc)
+
+        Must NOT fail if provider_events table is not present yet (fresh DB before schema.sql).
+        """
         try:
-            cur.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            tables = {
+                r["name"]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
+            }
+        except Exception as e:
+            raise StorageError(f"failed to inspect sqlite_master: {e}") from e
+
+        if "provider_events" not in tables:
+            return
+
+        try:
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(provider_events);").fetchall()}
+
+            if "raw_body_sha256" not in cols:
+                conn.execute("ALTER TABLE provider_events ADD COLUMN raw_body_sha256 TEXT NULL;")
+            if "signature_verified_at_utc" not in cols:
+                conn.execute("ALTER TABLE provider_events ADD COLUMN signature_verified_at_utc TEXT NULL;")
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_provider_events_received_at_utc "
+                "ON provider_events(received_at_utc);"
             )
-            return {str(r[0]) for r in cur.fetchall()}
-        finally:
-            cur.close()
+        except Exception as e:
+            raise StorageError(f"failed to migrate provider_events audit fields: {e}") from e
 
-    def _table_columns(self, table: str) -> set[str]:
-        cur = self._conn.cursor()
+    def _migrate_accounts_last_provider_event(self, conn: sqlite3.Connection) -> None:
+        """
+        P2 ops-only migration (safe on existing LIVE DB, safe on fresh DB):
+
+        - add accounts.last_provider_event_at_utc TEXT NULL
+
+        Must NOT fail if accounts table is not present yet.
+        """
         try:
-            cur.execute(f"PRAGMA table_info({table})")
-            rows = cur.fetchall()
-            return {str(r[1]) for r in rows}
-        finally:
-            cur.close()
+            tables = {
+                r["name"]
+                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
+            }
+        except Exception as e:
+            raise StorageError(f"failed to inspect sqlite_master: {e}") from e
 
-    def _detect_layout(self) -> dict[str, bool]:
-        tables = self._list_tables()
-        layout: dict[str, bool] = {}
+        if "accounts" not in tables:
+            return
 
-        if "endpoint_leases" in tables:
-            cols = self._table_columns("endpoint_leases")
-            layout["leases_has_created_updated"] = ("created_at_utc" in cols and "updated_at_utc" in cols)
+        try:
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(accounts);").fetchall()}
+            if "last_provider_event_at_utc" not in cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN last_provider_event_at_utc TEXT NULL;")
+        except Exception as e:
+            raise StorageError(f"failed to migrate accounts.last_provider_event_at_utc: {e}") from e
 
-        if "topups" in tables:
-            cols = self._table_columns("topups")
-            layout["topups_has_ts_utc"] = "ts_utc" in cols
+    def detect_layout(self, conn: sqlite3.Connection) -> dict:
+        """
+        Small helper for diagnostics; does not affect runtime behavior.
+        """
+        layout: dict = {}
+        try:
+            tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()}
+        except Exception:
+            return layout
+
+        layout["has_provider_events"] = "provider_events" in tables
+        layout["has_accounts"] = "accounts" in tables
+
+        if layout["has_provider_events"]:
+            try:
+                cols = {row["name"] for row in conn.execute("PRAGMA table_info(provider_events);").fetchall()}
+                layout["provider_events_has_audit"] = (
+                    "raw_body_sha256" in cols and "signature_verified_at_utc" in cols
+                )
+            except Exception:
+                layout["provider_events_has_audit"] = False
+
+        if layout["has_accounts"]:
+            try:
+                cols = {row["name"] for row in conn.execute("PRAGMA table_info(accounts);").fetchall()}
+                layout["accounts_has_last_provider_event"] = "last_provider_event_at_utc" in cols
+            except Exception:
+                layout["accounts_has_last_provider_event"] = False
 
         return layout

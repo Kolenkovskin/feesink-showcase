@@ -1,4 +1,4 @@
-# STRIPE_CONTRACT_v1 — FeeSink
+# FeeSink — STRIPE CONTRACT v1
 
 Version: v2026.01.19-02  
 Status: **LIVE / FROZEN**  
@@ -8,31 +8,31 @@ Scope: FeeSink — Stripe Checkout + Webhook (LIVE)
 
 ## ⚠️ LIVE CONTRACT — CHANGE CONTROL (P0)
 
-Этот контракт **заморожен** после подтверждённого факта:
+This contract is **frozen** after a confirmed milestone:  
 **STRIPE_LIVE_END2END_PASS (2026-01-19)**.
 
-Любые изменения:
-- допускаются **только** в новом файле `STRIPE_CONTRACT_v2.md`,
-- требуют нового этапа проекта и отдельного milestone.
+Any changes:
+- are allowed **only** in a new file `STRIPE_CONTRACT_v2.md`
+- require a new project phase and a separate milestone
 
-Изменение данного файла запрещено.
+Modifying this file is **forbidden**.
 
 ---
 
 ## 0. Purpose
 
-Канонический LIVE-контракт Stripe для FeeSink.  
-Фиксирует **единственно допустимую** логику приёма денег в production.
+This document defines the **canonical LIVE Stripe contract** for FeeSink.  
+It fixes the **only allowed** logic for accepting payments in production.
 
 ---
 
 ## 1. Stripe Mode Invariant (P0)
 
-- `FEESINK_STRIPE_MODE=live`
-- Используются **только** `sk_live_*`, `whsec_live_*`
-- TEST/LIVE mixing запрещён
+- `FEESINK_STRIPE_MODE = live`
+- Only `sk_live_*` and `whsec_live_*` keys are allowed
+- TEST / LIVE mixing is strictly forbidden
 
-Нарушение = критическая ошибка биллинга.
+Violation = **critical billing error**.
 
 ---
 
@@ -42,20 +42,19 @@ Endpoint:
 
 POST /v1/stripe/checkout_sessions
 
-yaml
-Copy code
 
-Правила (P0):
+### Rules (P0)
 
-- Цена выбирается **только** из ENV:
+- The price is selected **only** from ENV:
   - `STRIPE_PRICE_ID_EUR_50`
-- Тело запроса не влияет на цену
-- `price_id` **не принимается** от клиента
+- Request body **cannot** affect the price
+- `price_id` is **never accepted** from the client
 
-Side effects:
+### Side effects
 
-- Создаётся Stripe Checkout Session
-- Записывается `stripe_links(stripe_session_id → account_id)`
+- A Stripe Checkout Session is created
+- A mapping is stored:
+  - `stripe_links(stripe_session_id → account_id)`
 
 ---
 
@@ -65,57 +64,56 @@ Endpoint:
 
 POST /v1/webhooks/stripe
 
-yaml
-Copy code
 
-Единственный событие, которое может привести к credit:
+### The only event that may trigger a credit
 
 - `checkout.session.completed`
 
-Все прочие события:
-- принимаются (HTTP 200)
-- **никогда** не приводят к зачислению средств
+### All other events
+
+- are accepted (HTTP 200)
+- **never** result in a credit
 
 ---
 
 ## 4. provider_events — Audit Only (P0)
 
-- Все события записываются в `provider_events`
-- Dedup по `provider_event_id`
-- **Dedup не является idempotency credit**
+- All Stripe events are stored in `provider_events`
+- Deduplication by `provider_event_id`
+- **provider_events is NOT a credit idempotency boundary**
 
-Запрещено:
-- использовать provider_events как gate для credit
+Forbidden:
+- using `provider_events` as a credit gate
 
 ---
 
 ## 5. Account Resolution (LIVE)
 
-Порядок:
+Resolution order:
 
 1. `event.data.object.metadata.account_id`
-2. `stripe_links.account_id` по `session.id`
+2. `stripe_links.account_id` by `session.id`
 
-Если `account_id` не разрешён:
-- credit запрещён
-- webhook → HTTP 500
-- Stripe выполнит retry
+If `account_id` cannot be resolved:
+- credit is forbidden
+- webhook returns HTTP 500
+- Stripe retries the webhook
 
 ---
 
 ## 6. Price → Units Mapping (P0)
 
-- `metadata.price_id` обязателен
-- Mapping только через `PRICE_UNITS_MAPPING_v1.md`
-- Fallback или расчёты запрещены
+- `metadata.price_id` is mandatory
+- Mapping is defined **only** in `PRICE_UNITS_MAPPING_v1.md`
+- Fallbacks or calculations are forbidden
 
 ---
 
 ## 7. Credit Contract (TopUp)
 
-Credit возможен **только если**:
+Credit is allowed **only if**:
 
-- событие = `checkout.session.completed`
+- event = `checkout.session.completed`
 - `payment_status == paid`
 
 Domain object:
@@ -129,18 +127,17 @@ TopUp(
   ts_utc
 )
 8. Idempotency (P0)
-Единственная граница идемпотентности credit:
+The only idempotency boundary for crediting is:
 
-Copy code
 topups.tx_hash
-Повторы webhook:
+Repeated webhooks:
 
-не приводят к двойному зачислению
+never cause double credit
 
-не блокируют первый credit
+never block the first valid credit
 
 9. Observability (Required)
-Каждый LIVE credit логирует:
+Each LIVE credit MUST log:
 
 provider_event_id
 
@@ -154,8 +151,8 @@ credited_units
 
 decision (credited | dedup | failed)
 
-Silent failure запрещён.
+Silent failure is forbidden.
 
 10. Status
-Stripe LIVE контракт зафиксирован и заморожен.
-Любая правка → новый контракт и новый этап проекта.
+The Stripe LIVE contract is fixed and frozen.
+Any change requires a new contract version and a new project phase.

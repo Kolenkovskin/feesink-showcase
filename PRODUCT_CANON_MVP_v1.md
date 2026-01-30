@@ -1,153 +1,153 @@
 # FeeSink — Product Canon (MVP v1)
 
-Версия: v2026.01.03  
-Статус: канонический, Phase 2 подтверждён demo-прогоном
+Version: v2026.01.03  
+Status: canonical, Phase 2 validated by demo run
 
-Этот документ фиксирует **продуктовый канон MVP**.
-Если любой другой документ или код противоречит этому файлу — **этот файл имеет приоритет**.
-
----
-
-## 1) Что такое FeeSink (коротко)
-
-FeeSink — это сервис, который **продаёт checks**.
-
-Check — это один факт попытки проверки HTTP endpoint’а.
-Результат проверки (`ok` / `fail`) **не влияет** на факт списания.
+This document defines the **canonical MVP product rules**.
+If any other document or code contradicts this file — **this file has priority**.
 
 ---
 
-## 2) Каноническое продуктовое обещание
+## 1) What FeeSink is (short)
 
-Пользователь покупает **prepaid units**.  
-Каждый выполненный check **детерминированно** списывает **1 unit**.
+FeeSink is a service that **sells checks**.
 
-Никаких подписок.  
-Никаких тарифов.  
-Никакой постоплаты.
+A *check* is a single fact of attempting to check an HTTP endpoint.
+The check result (`ok` / `fail`) **does not affect charging**.
 
 ---
 
-## 3) Абсолютные продуктовые инварианты (P0)
+## 2) Canonical product promise
 
-Эти правила **не обсуждаются** и не ослабляются без явного решения:
+The user buys **prepaid units**.  
+Each performed check **deterministically** consumes **exactly 1 unit**.
 
-- prepaid balance only
-- 1 check = 1 unit
-- списание **строго после факта проверки** (post-check)
-- повтор check’а не может привести к повторному списанию
-- повтор payment event не может привести к повторному зачислению
-- отсутствие средств — корректное состояние, а не ошибка
-- система предпочитает **не выполнить check**, чем выполнить его без корректного списания
+No subscriptions.  
+No plans.  
+No postpaid billing.
 
 ---
 
-## 4) Каноническая модель списаний (Phase 2)
+## 3) Absolute product invariants (P0)
 
-### Текущий канон (SQLite / demo / dev)
+These rules are **not negotiable** and cannot be weakened without an explicit decision:
 
-- Каноническая запись списания — строка в таблице `check_events`
-- Идемпотентность обеспечивается `UNIQUE(dedup_key)`
-- Формат `dedup_key`:  
+- prepaid balance only  
+- 1 check = 1 unit  
+- charging happens **strictly after the check fact** (post-check)  
+- retrying a check must never cause double charging  
+- retrying a payment event must never cause double crediting  
+- zero balance is a valid state, not an error  
+- the system prefers **not to perform a check** rather than perform it without correct charging  
+
+---
+
+## 4) Canonical charging model (Phase 2)
+
+### Current canon (SQLite / demo / dev)
+
+- The canonical charge record is a row in the `check_events` table
+- Idempotency is enforced via `UNIQUE(dedup_key)`
+- `dedup_key` format:  
   `endpoint_id + ":" + scheduled_at_utc`
-- `scheduled_at_utc` обязателен и всегда в UTC
-- Если `balance_units < 1`:
-  - check **не выполняется**
-  - записи в `check_events` не создаются
-  - частичных эффектов нет
+- `scheduled_at_utc` is mandatory and always UTC
+- If `balance_units < 1`:
+  - the check is **not performed**
+  - no `check_events` record is created
+  - no partial side effects occur
 
-### Таблица `charges`
+### `charges` table
 
-- В MVP Phase 2 **не используется**
-- Зарезервирована для будущих фаз
-- Не является источником истины в текущем каноне
-
----
-
-## 5) Что пользователь реально покупает
-
-Пользователь покупает:
-- не аптайм,
-- не SLA,
-- не отчёты,
-- не гарантии.
-
-Пользователь покупает **попытки проверки**.
-
-Каждая попытка:
-- учитывается,
-- тарифицируется,
-- воспроизводима.
+- **Not used** in MVP Phase 2
+- Reserved for future phases
+- Not a source of truth in the current canon
 
 ---
 
-## 6) Scope MVP (что входит)
+## 5) What the user actually buys
 
-В MVP **входит**:
+The user does **not** buy:
+- uptime,
+- SLA,
+- reports,
+- guarantees.
 
-- приём платежей → конвертация в units
-- идемпотентное зачисление units
-- добавление / пауза / удаление endpoint’ов
-- планировщик checks
-- детерминированное списание units
-- отказ при depletion без побочных эффектов
+The user buys **check attempts**.
 
----
-
-## 7) Explicit Non-Goals (MVP)
-
-В MVP **не входит**:
-
-- подписки
-- тарифные планы
-- авто-продление
-- мониторинговые дашборды
-- алертинг
-- отчёты
-- аналитика
-- SLA / гарантии
-- пользовательские роли
-- визуальные UI
-
-Любая из этих функций допустима **только после MVP**.
+Each attempt is:
+- counted,
+- charged,
+- reproducible.
 
 ---
 
-## 8) Экономическая цель MVP
+## 6) MVP scope (what is included)
 
-Цель MVP:
-> как можно быстрее дойти до первых **реальных продаж**
+The MVP **includes**:
 
-Это означает:
-- минимальный UX,
-- минимальный UI,
-- максимальная надёжность биллинга.
-
-Любая задача, которая не приближает оплату — **вне канона MVP**.
+- payment intake → conversion to units
+- idempotent crediting of units
+- adding / pausing / removing endpoints
+- check scheduler
+- deterministic unit charging
+- clean refusal on depletion with no side effects
 
 ---
 
-## 9) Совместимость с будущими фазами
+## 7) Explicit non-goals (MVP)
 
-Несмотря на минимализм MVP:
+The MVP **does not include**:
 
-- все события должны быть аудируемы
-- idempotency keys должны быть стабильны
-- storage-модель должна быть расширяемой
-- решения MVP не должны блокировать:
+- subscriptions
+- pricing plans
+- auto-renewal
+- monitoring dashboards
+- alerting
+- reports
+- analytics
+- SLA / guarantees
+- user roles
+- visual UI
+
+Any of these features are allowed **only after MVP**.
+
+---
+
+## 8) Economic goal of the MVP
+
+The goal of the MVP is:
+> to reach the first **real payments** as quickly as possible
+
+This implies:
+- minimal UX,
+- minimal UI,
+- maximum billing reliability.
+
+Any task that does not move toward payment is **out of MVP scope**.
+
+---
+
+## 9) Compatibility with future phases
+
+Despite MVP minimalism:
+
+- all events must be auditable
+- idempotency keys must be stable
+- the storage model must be extensible
+- MVP decisions must not block:
   - Stripe
   - Postgres
   - reconciliation
-  - отчётность
+  - reporting
 
 ---
 
-## 10) Финальное каноническое утверждение
+## 10) Final canonical statement
 
-FeeSink — это биллинговое ядро для checks.
+FeeSink is a billing core for checks.
 
-Если поведение системы нарушает правило  
-**«1 выполненный check = 1 unit списания»**,  
-то это **ошибка**, а не фича.
+If the system violates the rule  
+**“1 performed check = 1 charged unit”**,  
+this is a **bug**, not a feature.
 
-MVP считается корректным **только при строгом соблюдении этого канона**.
+The MVP is considered valid **only if this canon is strictly enforced**.
